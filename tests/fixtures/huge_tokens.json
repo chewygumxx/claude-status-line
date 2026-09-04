@@ -1,0 +1,20 @@
+{
+  "context_window": {
+    "used_percentage": 97.6,
+    "total_input_tokens": 12345678,
+    "total_output_tokens": 2500000,
+    "current_usage": {
+      "input_tokens": 15000,
+      "output_tokens": 9999,
+      "cache_creation_input_tokens": 1000000,
+      "cache_read_input_tokens": 999999
+    }
+  },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 88.4 },
+    "seven_day": { "used_percentage": 79.6 }
+  },
+  "cost": { "total_duration_ms": 5025000 },
+  "workspace": { "current_dir": "/home/chewygumxx/dev/claude-status-line" },
+  "model": { "display_name": "Claude Opus 5" }
+}

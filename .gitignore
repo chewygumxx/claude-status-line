@@ -1,0 +1,11 @@
+# vim:set expandtab shiftwidth=4 filetype=gitignore:
+# SPDX-License-Identifier: GPL-3.0-only
+
+#
+#
+# ~chewygumxx/claude-status-line.git
+# ::: :/.gitignore
+#
+#
+
+/target/

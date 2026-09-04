@@ -1,0 +1,20 @@
+{
+  "context_window": {
+    "used_percentage": 42,
+    "total_input_tokens": 949,
+    "total_output_tokens": 13133,
+    "current_usage": {
+      "input_tokens": 1,
+      "output_tokens": 36,
+      "cache_creation_input_tokens": 277,
+      "cache_read_input_tokens": 64600
+    }
+  },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 30 },
+    "seven_day": { "used_percentage": 12 }
+  },
+  "cost": { "total_duration_ms": 754000 },
+  "workspace": { "current_dir": "/home/chewygumxx/dev/claude-status-line" },
+  "model": { "display_name": "Claude Sonnet 5" }
+}
