@@ -7,9 +7,9 @@
 //
 //
 
-//! Assembles the status-line's field groups: model/effort, the token
-//! counts, and the limit gauges, joined by [`crate::render_payload`] into
-//! a single printed line.
+//! Assembles the status-line's field groups: the `WHERE` row (repository
+//! location or pwd), model/effort, the token counts, and the limit gauges,
+//! joined by [`crate::render_payload`] into the final two-line output.
 //!
 //! The original script hand-rolled each group's string concatenation
 //! separately, which is how it ended up with two byte-for-byte identical
@@ -155,6 +155,85 @@ pub fn row_config(tier: Tier, model: &str, effort: &str) -> String {
     )
 }
 
+/// The dirty/unpushed counter prefixed to the in-repository `WHERE` row.
+/// Plain data, with no dependency on `repo_status` here: `render_payload`
+/// converts `repo_status::RepoStatus` into this, keeping this module
+/// decoupled from how the numbers were obtained, the same reason it takes
+/// plain `&str`s rather than `git::RepoInfo` below.
+pub struct DirtyCounter {
+    pub count: usize,
+    pub unpushed: bool,
+}
+
+/// The pieces `row_where` needs to render the in-repository form of the
+/// `WHERE` row.
+pub struct RepoLocation<'a> {
+    /// Current branch, or a short detached-HEAD hash; omitted from the
+    /// rendered row entirely when it's exactly `"main"` or `None`.
+    pub branch: Option<&'a str>,
+    /// The `origin` remote's owner/org, already resolved to its fallback.
+    pub owner: &'a str,
+    /// The `origin` remote's repository name, already resolved to its
+    /// fallback.
+    pub repo: &'a str,
+    /// Path relative to the repo root; empty when cwd *is* the root, which
+    /// omits the trailing `:path` from the rendered row entirely.
+    pub path: &'a str,
+    /// `None` omits the counter entirely (clean and fully pushed, or the
+    /// query couldn't be run at all).
+    pub counter: Option<DirtyCounter>,
+}
+
+/// The `WHERE` row's two possible shapes: inside a repository, or not.
+pub enum Where<'a> {
+    Repo(RepoLocation<'a>),
+    Pwd(&'a str),
+}
+
+/// Row 0 (`WHERE`): `[!]<count> <branch> ~<owner>/<repo>.git:<path>` inside
+/// a repository (branch omitted when `main` or unresolvable, `:<path>`
+/// omitted when `path` is empty, the counter omitted when there's nothing
+/// to report), or just the home-shortened working directory outside one.
+pub fn row_where(tier: Tier, where_: Where) -> String {
+    let loc = match where_ {
+        Where::Pwd(pwd) => return theme::role(tier, Role::Path, false, pwd),
+        Where::Repo(loc) => loc,
+    };
+
+    let mut out = String::new();
+
+    if let Some(counter) = &loc.counter {
+        let severity = if counter.unpushed || counter.count > 0 {
+            Role::Warning
+        } else {
+            Role::Muted
+        };
+        let mut text = String::new();
+        if counter.unpushed {
+            text.push('!');
+        }
+        text.push_str(&counter.count.to_string());
+        out.push_str(&theme::role(tier, severity, false, &text));
+        out.push(' ');
+    }
+
+    if let Some(branch) = loc.branch
+        && branch != "main"
+    {
+        out.push_str(&theme::role(tier, Role::Success, false, branch));
+        out.push(' ');
+    }
+
+    let mut expr = format!("~{}/{}.git", loc.owner, loc.repo);
+    if !loc.path.is_empty() {
+        expr.push(':');
+        expr.push_str(loc.path);
+    }
+    out.push_str(&theme::role(tier, Role::Path, false, &expr));
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +292,95 @@ mod tests {
     fn row_config_joins_model_and_effort_with_space() {
         let out = strip_ansi(&row_config(Tier::Plain, "Claude Sonnet 5", "HIGH"));
         assert_eq!(out, "Claude Sonnet 5 HIGH");
+    }
+
+    fn repo_loc<'a>(branch: Option<&'a str>, path: &'a str) -> RepoLocation<'a> {
+        RepoLocation {
+            branch,
+            owner: "chewygumxx",
+            repo: "claude-status-line",
+            path,
+            counter: None,
+        }
+    }
+
+    #[test]
+    fn row_where_non_main_branch_is_shown() {
+        let out = row_where(Tier::Plain, Where::Repo(repo_loc(Some("feature"), "")));
+        assert_eq!(out, "feature ~chewygumxx/claude-status-line.git");
+    }
+
+    #[test]
+    fn row_where_main_branch_is_omitted() {
+        let out = row_where(Tier::Plain, Where::Repo(repo_loc(Some("main"), "")));
+        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+    }
+
+    #[test]
+    fn row_where_no_branch_is_omitted() {
+        let out = row_where(Tier::Plain, Where::Repo(repo_loc(None, "")));
+        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+    }
+
+    #[test]
+    fn row_where_empty_path_omits_colon() {
+        let out = row_where(Tier::Plain, Where::Repo(repo_loc(Some("main"), "")));
+        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+    }
+
+    #[test]
+    fn row_where_nonempty_path_appends_colon_and_path() {
+        let out = row_where(
+            Tier::Plain,
+            Where::Repo(repo_loc(Some("main"), "src/render.rs")),
+        );
+        assert_eq!(out, "~chewygumxx/claude-status-line.git:src/render.rs");
+    }
+
+    #[test]
+    fn row_where_pwd_variant_shows_only_pwd() {
+        let out = row_where(Tier::Plain, Where::Pwd("~/dev/claude-status-line"));
+        assert_eq!(out, "~/dev/claude-status-line");
+    }
+
+    #[test]
+    fn row_where_no_counter_omits_prefix() {
+        let mut loc = repo_loc(Some("main"), "");
+        loc.counter = None;
+        let out = row_where(Tier::Plain, Where::Repo(loc));
+        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+    }
+
+    #[test]
+    fn row_where_clean_counter_shows_bare_count() {
+        let mut loc = repo_loc(Some("main"), "");
+        loc.counter = Some(DirtyCounter {
+            count: 3,
+            unpushed: false,
+        });
+        let out = row_where(Tier::Plain, Where::Repo(loc));
+        assert_eq!(out, "3 ~chewygumxx/claude-status-line.git");
+    }
+
+    #[test]
+    fn row_where_unpushed_counter_prepends_bang() {
+        let mut loc = repo_loc(Some("main"), "");
+        loc.counter = Some(DirtyCounter {
+            count: 0,
+            unpushed: true,
+        });
+        let out = row_where(Tier::Plain, Where::Repo(loc));
+        assert_eq!(out, "!0 ~chewygumxx/claude-status-line.git");
+    }
+
+    #[test]
+    fn row_where_plain_tier_emits_no_escape_codes() {
+        let mut loc = repo_loc(Some("feature"), "src/render.rs");
+        loc.counter = Some(DirtyCounter {
+            count: 2,
+            unpushed: true,
+        });
+        let out = row_where(Tier::Plain, Where::Repo(loc));
+        assert!(!out.contains('\x1b'));
     }
 }

@@ -93,7 +93,8 @@ pub enum Role {
     EffortHigh,
     /// The model name.
     Model,
-    /// The current working directory.
+    /// The `WHERE` row: the `~owner/repo.git:path` expression inside a
+    /// repository, or the home-shortened working directory outside one.
     Path,
     /// Row labels, deltas, separators, and unknown/`?` values (no ANSI16 equivalent as a distinct gray).
     Muted,

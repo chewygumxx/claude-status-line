@@ -96,6 +96,12 @@ fn golden_fixtures_match_expected_output() {
     // it on drop, so a failing assertion below still cleans up.
     let _home_guard = HomeGuard::set(&hermetic_home());
 
+    // `render_fixture` forces `workspace.current_dir` to `hermetic_cwd()`,
+    // a nonexistent temp path with no git repo above it, so every fixture
+    // below exercises the `WHERE` row's no-repo pwd fallback: just that path
+    // (unshortened, since it isn't under the hermetic `$HOME` either).
+    let where_line = hermetic_cwd().display().to_string();
+
     let cases: [(&str, &str); 5] = [
         (
             "normal",
@@ -123,10 +129,11 @@ fn golden_fixtures_match_expected_output() {
         ),
     ];
 
-    for (name, expected) in &cases {
+    for (name, expected_second_line) in &cases {
+        let expected = format!("{where_line}\n{expected_second_line}");
         let actual = render_fixture(name);
         assert_eq!(
-            &actual, expected,
+            actual, expected,
             "fixture {name} did not match expected output"
         );
     }

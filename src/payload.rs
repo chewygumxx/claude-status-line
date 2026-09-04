@@ -38,6 +38,11 @@ pub struct Payload {
     pub model: Model,
     #[serde(default)]
     pub effort: Effort,
+    /// Unique, stable-for-the-session identifier Claude Code assigns this
+    /// session. Used only to key `repo_status`'s on-disk cache so concurrent
+    /// sessions in different repositories don't read each other's cached
+    /// git state; absent before the first user input.
+    pub session_id: Option<String>,
 }
 
 impl Payload {
