@@ -169,15 +169,16 @@ pub struct DirtyCounter {
 /// `WHERE` row.
 pub struct RepoLocation<'a> {
     /// Current branch, or a short detached-HEAD hash; omitted from the
-    /// rendered row entirely when it's exactly `"main"` or `None`.
+    /// rendered row only when unresolvable (`None`) -- shown for every
+    /// actual branch, `main` included.
     pub branch: Option<&'a str>,
     /// The `origin` remote's owner/org, already resolved to its fallback.
     pub owner: &'a str,
     /// The `origin` remote's repository name, already resolved to its
     /// fallback.
     pub repo: &'a str,
-    /// Path relative to the repo root; empty when cwd *is* the root, which
-    /// omits the trailing `:path` from the rendered row entirely.
+    /// Path relative to the repo root, `/`-separated; empty when cwd *is*
+    /// the root.
     pub path: &'a str,
     /// `None` omits the counter entirely (clean and fully pushed, or the
     /// query couldn't be run at all).
@@ -190,10 +191,12 @@ pub enum Where<'a> {
     Pwd(&'a str),
 }
 
-/// Row 0 (`WHERE`): `[!]<count> <branch> ~<owner>/<repo>.git:<path>` inside
-/// a repository (branch omitted when `main` or unresolvable, `:<path>`
-/// omitted when `path` is empty, the counter omitted when there's nothing
-/// to report), or just the home-shortened working directory outside one.
+/// Row 0 (`WHERE`): `[!]<count> <branch> ~<owner>/<repo>.git:/<path>` inside
+/// a repository (branch always shown when resolvable, `:/` always shown
+/// -- bold when `path` is empty, i.e. cwd *is* the repo root -- the counter
+/// omitted when there's nothing to report), or just the home-shortened
+/// working directory outside one. Per-token colors are specified in
+/// `.claude/reference/where_row_colors.md`.
 pub fn row_where(tier: Tier, where_: Where) -> String {
     let loc = match where_ {
         Where::Pwd(pwd) => return theme::role(tier, Role::Path, false, pwd),
@@ -217,19 +220,31 @@ pub fn row_where(tier: Tier, where_: Where) -> String {
         out.push(' ');
     }
 
-    if let Some(branch) = loc.branch
-        && branch != "main"
-    {
-        out.push_str(&theme::role(tier, Role::Success, false, branch));
+    if let Some(branch) = loc.branch {
+        out.push_str(&theme::role(tier, Role::Branch, false, branch));
         out.push(' ');
     }
 
-    let mut expr = format!("~{}/{}.git", loc.owner, loc.repo);
-    if !loc.path.is_empty() {
-        expr.push(':');
-        expr.push_str(loc.path);
+    out.push_str(&theme::role(tier, Role::Punctuation, false, "~"));
+    out.push_str(&theme::role(tier, Role::Owner, false, loc.owner));
+    out.push_str(&theme::role(tier, Role::Divider, false, "/"));
+    out.push_str(&theme::role(tier, Role::Repo, false, loc.repo));
+    out.push_str(&theme::role(tier, Role::Punctuation, false, ".git"));
+
+    let at_root = loc.path.is_empty();
+    out.push_str(&theme::role(tier, Role::PathMarker, at_root, ":/"));
+
+    if !at_root {
+        let mut segments = loc.path.split('/').peekable();
+        while let Some(segment) = segments.next() {
+            if segments.peek().is_some() {
+                out.push_str(&theme::role(tier, Role::Directory, false, segment));
+                out.push_str(&theme::role(tier, Role::Punctuation, false, "/"));
+            } else {
+                out.push_str(&theme::role(tier, Role::Path, false, segment));
+            }
+        }
     }
-    out.push_str(&theme::role(tier, Role::Path, false, &expr));
 
     out
 }
@@ -307,34 +322,61 @@ mod tests {
     #[test]
     fn row_where_non_main_branch_is_shown() {
         let out = row_where(Tier::Plain, Where::Repo(repo_loc(Some("feature"), "")));
-        assert_eq!(out, "feature ~chewygumxx/claude-status-line.git");
+        assert_eq!(out, "feature ~chewygumxx/claude-status-line.git:/");
     }
 
     #[test]
-    fn row_where_main_branch_is_omitted() {
+    fn row_where_main_branch_is_also_shown() {
         let out = row_where(Tier::Plain, Where::Repo(repo_loc(Some("main"), "")));
-        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+        assert_eq!(out, "main ~chewygumxx/claude-status-line.git:/");
     }
 
     #[test]
     fn row_where_no_branch_is_omitted() {
         let out = row_where(Tier::Plain, Where::Repo(repo_loc(None, "")));
-        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+        assert_eq!(out, "~chewygumxx/claude-status-line.git:/");
     }
 
     #[test]
-    fn row_where_empty_path_omits_colon() {
+    fn row_where_empty_path_still_shows_colon_slash() {
         let out = row_where(Tier::Plain, Where::Repo(repo_loc(Some("main"), "")));
-        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+        assert_eq!(out, "main ~chewygumxx/claude-status-line.git:/");
     }
 
     #[test]
-    fn row_where_nonempty_path_appends_colon_and_path() {
+    fn row_where_nonempty_path_appends_after_colon_slash() {
         let out = row_where(
             Tier::Plain,
             Where::Repo(repo_loc(Some("main"), "src/render.rs")),
         );
-        assert_eq!(out, "~chewygumxx/claude-status-line.git:src/render.rs");
+        assert_eq!(out, "main ~chewygumxx/claude-status-line.git:/src/render.rs");
+    }
+
+    #[test]
+    fn row_where_colon_slash_is_bold_only_at_root() {
+        let root = row_where(Tier::Ansi256, Where::Repo(repo_loc(Some("main"), "")));
+        assert!(
+            root.contains("\x1b[1m\x1b[38;5;15m:/\x1b[0m"),
+            "expected bold `:/` at repo root, got {root:?}"
+        );
+
+        let nested = row_where(
+            Tier::Ansi256,
+            Where::Repo(repo_loc(Some("main"), "src/render.rs")),
+        );
+        assert!(
+            nested.contains("\x1b[38;5;15m:/\x1b[0m") && !nested.contains("\x1b[1m\x1b[38;5;15m"),
+            "expected non-bold `:/` away from repo root, got {nested:?}"
+        );
+    }
+
+    #[test]
+    fn row_where_multi_segment_path_colors_directories_and_current_dir_separately() {
+        let out = strip_ansi(&row_where(
+            Tier::TrueColor,
+            Where::Repo(repo_loc(Some("main"), "a/b/c")),
+        ));
+        assert_eq!(out, "main ~chewygumxx/claude-status-line.git:/a/b/c");
     }
 
     #[test]
@@ -348,7 +390,7 @@ mod tests {
         let mut loc = repo_loc(Some("main"), "");
         loc.counter = None;
         let out = row_where(Tier::Plain, Where::Repo(loc));
-        assert_eq!(out, "~chewygumxx/claude-status-line.git");
+        assert_eq!(out, "main ~chewygumxx/claude-status-line.git:/");
     }
 
     #[test]
@@ -359,7 +401,7 @@ mod tests {
             unpushed: false,
         });
         let out = row_where(Tier::Plain, Where::Repo(loc));
-        assert_eq!(out, "3 ~chewygumxx/claude-status-line.git");
+        assert_eq!(out, "3 main ~chewygumxx/claude-status-line.git:/");
     }
 
     #[test]
@@ -370,7 +412,7 @@ mod tests {
             unpushed: true,
         });
         let out = row_where(Tier::Plain, Where::Repo(loc));
-        assert_eq!(out, "!0 ~chewygumxx/claude-status-line.git");
+        assert_eq!(out, "!0 main ~chewygumxx/claude-status-line.git:/");
     }
 
     #[test]

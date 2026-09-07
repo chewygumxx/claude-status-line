@@ -81,7 +81,10 @@ pub fn detect_tier() -> Tier {
 /// The semantic colors used across the status line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Low/healthy usage; also the git branch.
+    /// Low/healthy usage; also the cache-read token count. Not the `WHERE`
+    /// row's git branch: that's [`Role::Branch`], a separate role even
+    /// though it happens to share this one's color, so retinting one never
+    /// silently retints the other.
     Success,
     /// Mid-range usage; also `MEDIUM` effort and cache-write counts.
     Warning,
@@ -93,11 +96,41 @@ pub enum Role {
     EffortHigh,
     /// The model name.
     Model,
-    /// The `WHERE` row: the `~owner/repo.git:path` expression inside a
-    /// repository, or the home-shortened working directory outside one.
+    /// The `WHERE` row's final path segment (the current directory itself),
+    /// or the home-shortened working directory outside a repository.
     Path,
     /// Row labels, deltas, separators, and unknown/`?` values (no ANSI16 equivalent as a distinct gray).
+    /// Not the `WHERE` row's `~`/`/`/`.git`/path-separator punctuation:
+    /// that's [`Role::Punctuation`], a separate role for the same reason
+    /// [`Role::Branch`] is split from [`Role::Success`].
     Muted,
+    /// The `WHERE` row: the `origin` remote's owner/org, in `~owner/repo.git`.
+    Owner,
+    /// The `WHERE` row: the `origin` remote's repository name, in `~owner/repo.git`.
+    Repo,
+    /// The `WHERE` row: the `:/ ` marker introducing the path, bolded when
+    /// the current directory *is* the repository root.
+    PathMarker,
+    /// The `WHERE` row: an ancestor directory segment of the path (every
+    /// segment before the final one, which is [`Role::Path`] instead).
+    Directory,
+    /// The `WHERE` row: the current git branch, or a short detached-HEAD
+    /// hash. Deliberately independent of [`Role::Success`] (see its doc
+    /// comment), so the `WHERE` row's colors can be retuned to match a
+    /// specific terminal palette (see
+    /// `.claude/reference/where_row_colors.md`) without affecting the
+    /// model/effort/token row.
+    Branch,
+    /// The `WHERE` row: the `~`, `.git`, and path-separator punctuation
+    /// (everywhere except the `<owner>`/`<repo>` divider, which is
+    /// [`Role::Divider`] instead). Deliberately independent of
+    /// [`Role::Muted`] for the same reason as [`Role::Branch`].
+    Punctuation,
+    /// The `WHERE` row: the single `/` dividing `<owner>` from `<repo>`,
+    /// e.g. `~owner`**`/`**`repo.git`. Colored separately from every other
+    /// punctuation character ([`Role::Punctuation`]) at the repo owner's
+    /// request.
+    Divider,
 }
 
 struct ColorSpec {
@@ -133,16 +166,62 @@ const fn spec(role: Role) -> ColorSpec {
             ansi256: 6,
             ansi16: AnsiColors::Cyan,
         },
-        Role::Path => ColorSpec {
-            truecolor: (255, 121, 198),
-            ansi256: 13,
-            ansi16: AnsiColors::BrightMagenta,
-        },
         // No legacy equivalent: keep the original script's exact xterm-256 indices.
         Role::EffortHigh => ColorSpec {
             truecolor: (255, 140, 0),
             ansi256: 208,
             ansi16: AnsiColors::Yellow,
+        },
+        // The `WHERE` row's truecolor values below are deliberately *not*
+        // curated independently of any terminal theme (unlike every role
+        // above): they're copied verbatim from the repo owner's own WezTerm
+        // `ansi`/`brights` tables (`~/.config/wezterm/color.lua`), because
+        // `detect_tier` prefers `Tier::TrueColor` whenever the terminal
+        // supports it, which bypasses the terminal's configured ANSI16
+        // palette entirely. Sourcing these RGB values from that palette
+        // directly is what makes the truecolor tier actually match what an
+        // `ansi16`-tier render would have looked like. See
+        // `.claude/reference/where_row_colors.md` for the full mapping and
+        // a note if this ever needs to track a different terminal's colors.
+        Role::Owner => ColorSpec {
+            truecolor: (0x5f, 0x95, 0xfa), // ansi4 Blue
+            ansi256: 4,
+            ansi16: AnsiColors::Blue,
+        },
+        Role::Repo => ColorSpec {
+            truecolor: (0x0f, 0xe1, 0x92), // ansi2 Green
+            ansi256: 2,
+            ansi16: AnsiColors::Green,
+        },
+        Role::PathMarker => ColorSpec {
+            truecolor: (0xe8, 0xe0, 0xff), // ansi15 BrightWhite
+            ansi256: 15,
+            ansi16: AnsiColors::BrightWhite,
+        },
+        Role::Directory => ColorSpec {
+            truecolor: (0x74, 0x08, 0xff), // ansi5 Magenta
+            ansi256: 5,
+            ansi16: AnsiColors::Magenta,
+        },
+        Role::Branch => ColorSpec {
+            truecolor: (0x7f, 0xc5, 0xdf), // ansi6 Cyan
+            ansi256: 6,
+            ansi16: AnsiColors::Cyan,
+        },
+        Role::Punctuation => ColorSpec {
+            truecolor: (0x4e, 0x41, 0x89), // ansi8 BrightBlack
+            ansi256: 8,
+            ansi16: AnsiColors::BrightBlack,
+        },
+        Role::Divider => ColorSpec {
+            truecolor: (0xca, 0xd6, 0xff), // ansi7 White
+            ansi256: 7,
+            ansi16: AnsiColors::White,
+        },
+        Role::Path => ColorSpec {
+            truecolor: (0xa4, 0x30, 0xff), // ansi13 BrightMagenta
+            ansi256: 13,
+            ansi16: AnsiColors::BrightMagenta,
         },
         Role::Muted => ColorSpec {
             truecolor: (139, 148, 158),
