@@ -441,12 +441,13 @@ cli_compare() {
 # `printf` format characters, shell metacharacters, glob characters in a path,
 # embedded newlines and tabs, and multi-byte text.
 mkdir -p "$WORK/with space/a b" "$WORK/glob/*star" "$WORK/uni/ünïcode"
+# shellcheck disable=SC2016 # the shell metacharacters below are payload
+# data and must stay unexpanded
 awkward_cases=(
     "$(printf '{"workspace":{"current_dir":"%s/with space/a b"},"model":{"display_name":"M"}}' "$WORK")"
     "$(printf '{"workspace":{"current_dir":"%s/glob/*star"},"model":{"display_name":"M"}}' "$WORK")"
     "$(printf '{"workspace":{"current_dir":"%s/uni/ünïcode"},"model":{"display_name":"M"}}' "$WORK")"
     '{"model":{"display_name":"100%% %s %d Model"}}'
-    # shellcheck disable=SC2016 # the point is that these stay unexpanded
     '{"model":{"display_name":"He said \"hi\" $(whoami) `id` ${HOME}"}}'
     '{"model":{"display_name":"line1\nline2"}}'
     '{"model":{"display_name":"a\tb"}}'
