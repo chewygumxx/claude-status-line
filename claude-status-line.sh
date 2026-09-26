@@ -1417,8 +1417,10 @@ render_payload() {
         effort=$R
     fi
     [ -z "$effort" ] && effort='?'
-    # DIVERGENCE: `${var^^}` is effectively ASCII, where Rust's `to_uppercase`
-    # is Unicode-aware. Effort levels are ASCII keywords, so this only shows on
+    # DIVERGENCE: `${var^^}` does handle single-character mappings in the
+    # current locale (`ü` uppercases), but not the one-to-many mappings Rust's
+    # `to_uppercase` performs: `straße` becomes `STRAßE` here and `STRASSE`
+    # under the binary. Effort levels are ASCII keywords, so this only shows on
     # a payload that invents a non-ASCII one.
     effort=${effort^^}
 

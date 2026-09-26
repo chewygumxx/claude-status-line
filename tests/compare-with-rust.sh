@@ -437,6 +437,29 @@ cli_compare() {
     fi
 }
 
+# Values that could plausibly break the shell implementation specifically:
+# `printf` format characters, shell metacharacters, glob characters in a path,
+# embedded newlines and tabs, and multi-byte text.
+mkdir -p "$WORK/with space/a b" "$WORK/glob/*star" "$WORK/uni/ünïcode"
+awkward_cases=(
+    "$(printf '{"workspace":{"current_dir":"%s/with space/a b"},"model":{"display_name":"M"}}' "$WORK")"
+    "$(printf '{"workspace":{"current_dir":"%s/glob/*star"},"model":{"display_name":"M"}}' "$WORK")"
+    "$(printf '{"workspace":{"current_dir":"%s/uni/ünïcode"},"model":{"display_name":"M"}}' "$WORK")"
+    '{"model":{"display_name":"100%% %s %d Model"}}'
+    # shellcheck disable=SC2016 # the point is that these stay unexpanded
+    '{"model":{"display_name":"He said \"hi\" $(whoami) `id` ${HOME}"}}'
+    '{"model":{"display_name":"line1\nline2"}}'
+    '{"model":{"display_name":"a\tb"}}'
+    '{"model":{"display_name":"Клод 中文 🙂"}}'
+    '{"model":{"display_name":"trailing space "}}'
+    '{"model":{"display_name":"-e"}}'
+    '{"session_id":"../../etc/passwd ok","model":{"display_name":"M"}}'
+)
+for payload in "${awkward_cases[@]}"; do
+    CASE_ENV=("HOME=$HERMETIC_HOME" 'FORCE_COLOR=3')
+    compare "awkward [${payload:0:56}]" "$payload"
+done
+
 cli_compare '--sample fixture' --sample "$REPO_ROOT/tests/fixtures/normal.json"
 cli_compare '--sample fixture --no-color' --sample "$REPO_ROOT/tests/fixtures/normal.json" --no-color
 cli_compare '--no-color with empty stdin' --no-color
@@ -449,7 +472,34 @@ cli_compare 'no arguments'
 
 
 # ---------------------------------------------------------------------------
-# 8. Known divergence: the Rust binary panics at the upper epoch bound
+# 8. Known divergences
+#
+# Both are asserted rather than skipped, so the suite speaks up if either side
+# changes and the matching DIVERGENCE note in `claude-status-line.sh` needs
+# revisiting.
+# ---------------------------------------------------------------------------
+
+# 8a. Uppercasing an effort level with a one-to-many case mapping. Rust's
+# `to_uppercase` turns `ß` into `SS`; bash's `${var^^}` leaves it alone.
+uppercase_payload='{"model":{"display_name":"M"},"effort":{"level":"straße"}}'
+CASE_ENV=("HOME=$HERMETIC_HOME" 'FORCE_COLOR=1')
+rust_out=$(printf '%s' "$uppercase_payload" | env "${CASE_ENV[@]}" "$BIN" 2>/dev/null)
+bash_out=$(printf '%s' "$uppercase_payload" | env "${CASE_ENV[@]}" "$BASH_IMPL" 2>/dev/null)
+case "$rust_out|$bash_out" in
+    *STRASSE*\|*STRAßE*)
+        PASS=$((PASS + 1))
+        [ "$VERBOSE" = 1 ] && printf 'ok    known divergence: one-to-many uppercase\n'
+        ;;
+    *)
+        FAIL=$((FAIL + 1))
+        printf 'FAIL  known uppercase divergence changed shape\n'
+        printf '        rust: %s\n' "$(printf '%s' "$rust_out" | tail -1 | cat -v)"
+        printf '        bash: %s\n' "$(printf '%s' "$bash_out" | tail -1 | cat -v)"
+        ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 8b. The Rust binary panics at the upper epoch bound
 #
 # `src/format/time.rs:33` applies the local offset with `to_offset`, which panics
 # when the shifted value leaves `OffsetDateTime`'s valid range. So a payload with
