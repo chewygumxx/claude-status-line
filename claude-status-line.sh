@@ -681,3 +681,182 @@ git_locate() {
     fi
     return 0
 }
+
+
+# ---------------------------------------------------------------------------
+# repo_status: port of `src/repo_status.rs`
+#
+# The one deliberate exception to the no-subprocess rule above, for the reason
+# that module documents: there is no sane way to answer "how many tracked files
+# are dirty" or "is HEAD ahead of the cached origin ref" without asking `git`.
+# The ahead-check never touches the network; it compares against whatever
+# `refs/remotes/origin/<branch>` currently says.
+# ---------------------------------------------------------------------------
+
+# Seconds a cached answer is reused before `git` is consulted again, matching
+# `CACHE_TTL` in the Rust module and the interval in Claude Code's own
+# documented example of this caching pattern.
+REPO_STATUS_TTL=5
+
+# Set by `repo_status_query`: whether a status could be determined at all, the
+# dirty-file count, and whether HEAD is ahead of the cached origin ref.
+STATUS_AVAILABLE=0
+STATUS_DIRTY=0
+STATUS_UNPUSHED=0
+
+# The current time in whole seconds, without forking `date` where bash 5's
+# `EPOCHSECONDS` is available.
+now_seconds() {
+    R=${EPOCHSECONDS:-$(date +%s)}
+}
+
+# A 64-bit FNV-1a hash of `$1`, in hex.
+#
+# DIVERGENCE: the Rust version hashes the repository root with
+# `std::collections::hash_map::DefaultHasher` (SipHash-1-3), which cannot be
+# reproduced here. The hash only has to be stable and collision-resistant enough
+# to keep two repositories in one session apart, so any decent hash does the
+# job; this one is a handful of shell arithmetic ops and, unlike `cksum`, costs
+# no fork. Because the digest differs from Rust's, cache files are given a
+# distinct name prefix below rather than being silently incompatible with the
+# binary's.
+fnv1a() {
+    local text=$1 i char hash=14695981039346656037
+    for ((i = 0; i < ${#text}; i++)); do
+        char=${text:i:1}
+        printf -v char '%d' "'$char"
+        # Overflow wraps, which is exactly what a hash wants.
+        hash=$(((hash ^ char) * 1099511628211))
+    done
+    printf -v R '%x' "$hash"
+}
+
+# The cache file for repository root `$1` in session `$2`.
+#
+# The session id comes out of an external JSON payload, so it is sanitized to a
+# bare filename fragment rather than trusted, the same reasoning (and the same
+# character class) as the Rust version's.
+repo_status_cache_path() {
+    local root=$1 session=$2 safe='' i char
+    for ((i = 0; i < ${#session}; i++)); do
+        char=${session:i:1}
+        case $char in
+            [A-Za-z0-9_-]) safe+=$char ;;
+            *) safe+='_' ;;
+        esac
+    done
+    fnv1a "$root"
+    R="${TMPDIR:-/tmp}/claude-status-line-sh-repo-status-${safe}-${R}"
+}
+
+# Counts tracked files with staged and/or unstaged changes. `git status
+# --porcelain` prints exactly one line per changed path, renames included,
+# whether the change is staged, unstaged, or both. Fails when `git` cannot be
+# run or exits non-zero, which is what makes the caller drop the counter
+# entirely instead of showing a wrong one.
+dirty_count() {
+    local root=$1 out
+    out=$(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null) || return 1
+    local -a lines=()
+    mapfile -t lines <<<"$out"
+    local count=0 line
+    for line in "${lines[@]}"; do
+        [ -n "$line" ] && count=$((count + 1))
+    done
+    R=$count
+}
+
+# True (exit 0) when HEAD holds commits the cached `origin/$2` does not, and
+# also when that comparison cannot be made at all: a missing remote-tracking
+# ref, no `origin`, an unborn HEAD, or a non-zero `git` exit all count as
+# unpushed rather than quietly hiding the marker.
+is_unpushed() {
+    local root=$1 branch=$2 out
+    out=$(git -C "$root" rev-list --count "origin/${branch}..HEAD" 2>/dev/null) || return 0
+    trim "$out"
+    case $R in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    # A count that cannot fit in bash arithmetic is certainly greater than zero.
+    [ ${#R} -gt 18 ] && return 0
+    [ "$R" -gt 0 ]
+}
+
+# Queries the counter for repository root `$1` on branch `$2` (possibly empty),
+# reusing a cached answer for session `$3` when one is fresh. An absent session
+# id skips the cache entirely, matching the Rust version's `session_id: None`
+# path.
+repo_status_query() {
+    local root=$1 branch=$2 session=$3
+    STATUS_AVAILABLE=0 STATUS_DIRTY=0 STATUS_UNPUSHED=0
+
+    local cache=''
+    if [ -n "$session" ]; then
+        repo_status_cache_path "$root" "$session"
+        cache=$R
+        if repo_status_read_cache "$cache"; then
+            return 0
+        fi
+    fi
+
+    if dirty_count "$root"; then
+        STATUS_AVAILABLE=1
+        STATUS_DIRTY=$R
+        if [ -z "$branch" ] || is_unpushed "$root" "$branch"; then
+            STATUS_UNPUSHED=1
+        fi
+    fi
+
+    [ -n "$cache" ] && repo_status_write_cache "$cache"
+    return 0
+}
+
+# Reads a cached answer from `$1`, succeeding only when the file exists, parses,
+# and is younger than `REPO_STATUS_TTL`.
+#
+# DIVERGENCE: the Rust version takes the entry's age from the file's mtime.
+# Recording the write time inside the file instead keeps this fork-free (no
+# `stat`), which matters in the one code path whose entire purpose is to avoid
+# process spawns. The cost is that the TTL is measured in whole seconds rather
+# than with sub-second precision.
+repo_status_read_cache() {
+    local path=$1 contents written rest
+    [ -f "$path" ] || return 1
+    contents=$(<"$path")
+    trim "$contents"
+    contents=$R
+
+    written=${contents%%|*}
+    rest=${contents#*|}
+    case $written in
+        ''|*[!0-9-]*) return 1 ;;
+    esac
+    now_seconds
+    [ $((R - written)) -gt "$REPO_STATUS_TTL" ] && return 1
+
+    if [ "$rest" = NONE ]; then
+        STATUS_AVAILABLE=0
+        return 0
+    fi
+    local count=${rest%%|*} unpushed=${rest##*|}
+    case $count in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    STATUS_AVAILABLE=1
+    STATUS_DIRTY=$count
+    [ "$unpushed" = 1 ] && STATUS_UNPUSHED=1 || STATUS_UNPUSHED=0
+    return 0
+}
+
+# Writes the current answer to `$1`. Best-effort: a read-only temp directory or
+# a race with a concurrent render just means the next render asks `git` again.
+repo_status_write_cache() {
+    local path=$1 payload
+    now_seconds
+    if [ "$STATUS_AVAILABLE" = 1 ]; then
+        payload="${R}|${STATUS_DIRTY}|${STATUS_UNPUSHED}"
+    else
+        payload="${R}|NONE"
+    fi
+    printf '%s' "$payload" >"$path" 2>/dev/null || true
+}
