@@ -301,3 +301,103 @@ bold() {
         R="${ESC}[1m${1}${ESC}[0m"
     fi
 }
+
+
+# ---------------------------------------------------------------------------
+# format: port of `src/format/tokens.rs` and `src/format/time.rs`
+#
+# Percentage rounding and severity banding (`src/format/gauge.rs`) are not here:
+# they happen inside this script's single `jq` call. `jq`'s `round` is C
+# `round()`, that is half away from zero, which is exactly what Rust's
+# `f64::round` does and exactly what bash arithmetic and `printf %.0f` (half to
+# even) do not. Token compaction below stays in `printf` for the mirror-image
+# reason: C `printf %.1f` rounds the binary value half to even, matching Rust's
+# `{:.1}`, where `jq` has no equivalent formatter.
+# ---------------------------------------------------------------------------
+
+# Every token count is handled as a decimal *string*, never as a bash integer:
+# the payload's counts are Rust `u64`s and bash arithmetic is signed 64-bit, so
+# a legitimate count near `u64::MAX` would overflow into nonsense. Length
+# comparisons and substring slicing have no such ceiling.
+
+# Groups `$1`'s digits in threes, e.g. `13133` becomes `13,133`.
+fmt_commas() {
+    local digits=$1 out=''
+    while [ ${#digits} -gt 3 ]; do
+        out=",${digits: -3}$out"
+        digits=${digits:0:${#digits}-3}
+    done
+    R="${digits}${out}"
+}
+
+# Divides `$1` by ten to the power `$2` by moving the decimal point, so the
+# quotient keeps every digit instead of passing through a 64-bit division.
+shift_decimal() {
+    local digits=$1 places=$2
+    while [ ${#digits} -le "$places" ]; do
+        digits="0$digits"
+    done
+    R="${digits:0:${#digits}-places}.${digits: -places}"
+}
+
+# Formats a token count compactly: comma-grouped below 10,000, `12.3k` below
+# 1,000,000, `1.2m` above. The thresholds are digit counts rather than numeric
+# comparisons (see above): 5 digits is 10,000, 7 digits is 1,000,000.
+fmt_compact() {
+    local n=$1
+    if [ ${#n} -ge 7 ]; then
+        shift_decimal "$n" 6
+        printf -v R '%.1fm' "$R"
+    elif [ ${#n} -ge 5 ]; then
+        shift_decimal "$n" 3
+        printf -v R '%.1fk' "$R"
+    else
+        fmt_commas "$n"
+    fi
+}
+
+# The bounds of `time::OffsetDateTime`, which spans years -9999 to 9999.
+# `from_unix_timestamp` fails outside them, and `src/format/time.rs` renders an
+# empty string for that failure.
+EPOCH_MIN=-377705116800
+EPOCH_MAX=253402300799
+
+# Renders rate-limit reset epoch `$1`, relative to now (`$2`), as `4:32p`, or as
+# `Fri 4:32p` when it does not fall within the next twelve hours. Empty for an
+# absent, zero, or out-of-range epoch.
+#
+# The Rust version reads hour/minute/weekday as integers off a parsed
+# `OffsetDateTime` specifically to avoid the non-portable `strftime("%-I")` the
+# original Python script used. This port needs a `date` call, but it asks for
+# `%H`/`%M`/`%a` and assembles the 12-hour clock itself, so there is still no
+# `%-I` in play. `LC_ALL=C` keeps the weekday abbreviation English rather than
+# locale-dependent, matching Rust's fixed `weekday_abbr` table.
+fmt_reset() {
+    local epoch=$1 now=$2
+    R=''
+    [ -z "$epoch" ] && return
+    [ "$epoch" = 0 ] && return
+    if [ "$epoch" -lt "$EPOCH_MIN" ] || [ "$epoch" -gt "$EPOCH_MAX" ]; then
+        return
+    fi
+
+    local fields hour minute weekday
+    fields=$(LC_ALL=C date -d "@$epoch" '+%H %M %a' 2>/dev/null) || return
+    read -r hour minute weekday <<<"$fields"
+    [ -z "$hour" ] && return
+
+    # `10#` forces base ten: `date`'s zero-padded `08` would otherwise be read
+    # as an invalid octal literal.
+    local h=$((10#$hour)) suffix='p'
+    [ "$h" -lt 12 ] && suffix='a'
+    local hour12=$((h % 12))
+    [ "$hour12" = 0 ] && hour12=12
+
+    local compact="${hour12}:${minute}${suffix}"
+    local delta=$((epoch - now))
+    if [ "$delta" -ge 0 ] && [ "$delta" -lt 43200 ]; then
+        R=$compact
+    else
+        R="$weekday $compact"
+    fi
+}
