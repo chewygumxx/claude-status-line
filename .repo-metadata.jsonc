@@ -1,0 +1,26 @@
+// vim:set expandtab shiftwidth=4 filetype=jsonc:
+// SPDX-License-Identifier: GPL-3.0-only
+
+//
+//
+// ~chewygumxx/claude-status-line.git
+// ::: :/.repo-metadata.jsonc
+//
+//
+
+{
+  "$schema": "https://raw.githubusercontent.com/chewygumxx/sync-repo-metadata/refs/tags/v2/schema.json",
+  "name": "claude-status-line",
+  "owner": "chewygumxx",
+  "slug": "chewygumxx/claude-status-line",
+  "default_branch": "main",
+  "description": "Print formatted quote, intended as splash text",
+  "category": "slop",
+  "topics": ["slop", "llm", "generated-trash"],
+  "license": {
+    "filepath": "./LICENSE",
+    "spdx_id": "GPL-3.0-only",
+    "full_name": "GNU General Public License v3.0 only",
+    "url": "https://spdx.org/licenses/GPL-3.0-only"
+  }
+}

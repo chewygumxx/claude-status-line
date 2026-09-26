@@ -1,0 +1,51 @@
+# vim:set expandtab shiftwidth=4 filetype=yaml foldlevel=5:
+# SPDX-License-Identifier: GPL-3.0-only
+
+#
+#
+# ~chewygumxx/claude-status-line.git
+# ::: :/.github/workflows/sync-repo-metadata.yaml
+#
+#
+
+name: Sync Repository Metadata
+on:
+  push:
+    paths:
+      - .repo-metadata.jsonc
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      # GITHUB_TOKEN is unable to attain repo administration purview via
+      # workflow permissions. Given this action provides for writing
+      # visibility, merge options, immutable_releases, etc., an
+      # Administration:write-capable token is required. To achieve this,
+      # the requisite token is minted via GitHub App installed on repo/org
+      # instead.
+      #
+      # Register the App via Settings > Developer settings > GitHub Apps,
+      # grant it repository permission "Administration: Read and write",
+      # and install it on the repo(s) this workflow runs. Store its client
+      # ID as the METADATA_APP_CLIENT_ID variable and its private key as
+      # the METADATA_APP_PRIVATE_KEY secret.
+      - name: Mint App Installation Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{    vars.METADATA_APP_CLIENT_ID   }}
+          private-key: ${{ secrets.METADATA_APP_PRIVATE_KEY }}
+          permission-administration: write
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Apply Metadata
+        uses: chewygumxx/sync-repo-metadata@v2
+        with:
+          metadata_path: .repo-metadata.jsonc
+          token: ${{ steps.app-token.outputs.token }}
