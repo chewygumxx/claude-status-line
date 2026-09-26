@@ -359,8 +359,38 @@ fmt_compact() {
 # The bounds of `time::OffsetDateTime`, which spans years -9999 to 9999.
 # `from_unix_timestamp` fails outside them, and `src/format/time.rs` renders an
 # empty string for that failure.
+#
+# DIVERGENCE: right at those bounds the two implementations part company, and
+# not in this script's favour to fix. `src/format/time.rs:33` applies the local
+# offset with `to_offset`, which *panics* when the shifted value leaves the valid
+# range, so the binary aborts the whole render (printing nothing at all) for
+# `resets_at: 253402300799` in any zone east of UTC. This script renders the
+# time instead. Reproducing the panic would mean deliberately discarding a
+# status line the binary only fails to print because of a bug.
 EPOCH_MIN=-377705116800
 EPOCH_MAX=253402300799
+
+# The current UTC offset in seconds, resolved once per run, matching Rust's
+# single `UtcOffset::current_local_offset()` lookup. Falls back to UTC, as
+# `local_offset()` does when the offset cannot be determined.
+LOCAL_OFFSET_SECONDS=''
+local_offset_seconds() {
+    if [ -z "$LOCAL_OFFSET_SECONDS" ]; then
+        local z sign hours minutes
+        z=$(date +%z 2>/dev/null)
+        case $z in
+            [-+][0-9][0-9][0-9][0-9])
+                sign=${z:0:1}
+                hours=$((10#${z:1:2}))
+                minutes=$((10#${z:3:2}))
+                LOCAL_OFFSET_SECONDS=$((hours * 3600 + minutes * 60))
+                [ "$sign" = - ] && LOCAL_OFFSET_SECONDS=$((-LOCAL_OFFSET_SECONDS))
+                ;;
+            *) LOCAL_OFFSET_SECONDS=0 ;;
+        esac
+    fi
+    R=$LOCAL_OFFSET_SECONDS
+}
 
 # Renders rate-limit reset epoch `$1`, relative to now (`$2`), as `4:32p`, or as
 # `Fri 4:32p` when it does not fall within the next twelve hours. Empty for an
@@ -382,7 +412,14 @@ fmt_reset() {
     fi
 
     local fields hour minute weekday
-    fields=$(LC_ALL=C date -d "@$epoch" '+%H %M %a' 2>/dev/null) || return
+    local_offset_seconds
+    # `date -d @<epoch>` would apply the offset in force *at that instant*,
+    # including historical and daylight-saving changes. Rust reads one offset
+    # (`UtcOffset::current_local_offset`, the offset right now) and applies it to
+    # every timestamp, so a reset on the far side of a daylight-saving boundary
+    # renders an hour off what `date` would say. Shifting the epoch and
+    # formatting in UTC reproduces Rust's arithmetic instead of correcting it.
+    fields=$(LC_ALL=C date -u -d "@$((epoch + R))" '+%H %M %a' 2>/dev/null) || return
     read -r hour minute weekday <<<"$fields"
     [ -z "$hour" ] && return
 
@@ -423,33 +460,66 @@ trim_start() {
 # Splits `$1` into `PATH_PARTS`, normalized the way Rust's `Path::components`
 # normalizes: repeated separators collapse and `.` segments drop out, while
 # `..` is left alone (`Path` resolves nothing on the filesystem, and neither
-# does this). `PATH_ABS` records whether the path was absolute.
+# does this). `PATH_ABS` records whether the path was absolute, and `PATH_ENDS`
+# the offset just past each component in the original string.
 #
 # Working in components rather than characters is the whole point of the Rust
 # module this ports: a `startswith`-style comparison (which is what the original
 # Python script did) treats `/home/chewygumxx` as living under `/home/chewygum`.
+#
+# `PATH_ENDS` exists because comparison and *display* need different strings.
+# Rust compares components but renders `Components::as_path()`, the raw
+# remaining slice, which only has its ends tidied: interior `//` and `/./`
+# survive into the output, so `~/a//b` and `:/a/./b` are what the binary really
+# prints. Recording offsets lets this port slice the same raw remainder rather
+# than rendering a normalized path the binary would not have produced.
 declare -a PATH_PARTS=()
+declare -a PATH_ENDS=()
 PATH_ABS=0
 path_split() {
-    local path=$1 part
+    local path=$1 part start i=0 n=${#1}
     PATH_PARTS=()
+    PATH_ENDS=()
     if [ "${path:0:1}" = / ]; then PATH_ABS=1; else PATH_ABS=0; fi
-    local -a raw=()
-    # `read -ra` rather than unquoted word splitting: a path segment containing
-    # a glob character must not be expanded against the filesystem.
-    IFS='/' read -ra raw <<<"$path"
-    for part in "${raw[@]}"; do
+    while [ "$i" -lt "$n" ]; do
+        while [ "$i" -lt "$n" ] && [ "${path:i:1}" = / ]; do
+            i=$((i + 1))
+        done
+        start=$i
+        while [ "$i" -lt "$n" ] && [ "${path:i:1}" != / ]; do
+            i=$((i + 1))
+        done
+        part=${path:start:i-start}
         case $part in
             ''|.) ;;
-            *) PATH_PARTS+=("$part") ;;
+            *)
+                PATH_PARTS+=("$part")
+                PATH_ENDS+=("$i")
+                ;;
         esac
     done
 }
 
-# Joins components `$@` into an absolute path string.
-join_abs() {
-    local IFS='/'
-    R="/$*"
+# Trims `$1` the way `Components::as_path` does: leading and trailing separators
+# and `.` components go, everything in the middle is left exactly as written.
+trim_path_ends() {
+    local s=$1
+    while :; do
+        case $s in
+            /*) s=${s#/} ;;
+            ./*) s=${s#./} ;;
+            .) s='' ;;
+            *) break ;;
+        esac
+    done
+    while :; do
+        case $s in
+            */) s=${s%/} ;;
+            */.) s=${s%/.} ;;
+            *) break ;;
+        esac
+    done
+    R=$s
 }
 
 # The process's physical working directory, matching Rust's
@@ -457,6 +527,8 @@ join_abs() {
 # rather than the logical `$PWD` bash inherits. `cd -P .` re-spells `PWD`
 # physically without moving anywhere and without forking a subshell.
 process_cwd() {
+    # shellcheck disable=SC2164 # a failed `cd .` leaves `$PWD` usable as-is,
+    # and aborting the render over it would be worse than a logical path
     builtin cd -P . 2>/dev/null
     R=$PWD
 }
@@ -470,10 +542,11 @@ shorten_home() {
     R=$path
     [ -z "$home" ] && return
 
-    local -a path_parts=() home_parts=()
+    local -a path_parts=() path_ends=() home_parts=()
     local path_abs
     path_split "$path"
     path_parts=("${PATH_PARTS[@]}")
+    path_ends=("${PATH_ENDS[@]}")
     path_abs=$PATH_ABS
     path_split "$home"
     home_parts=("${PATH_PARTS[@]}")
@@ -485,12 +558,18 @@ shorten_home() {
         [ "${path_parts[i]}" = "${home_parts[i]}" ] || return
     done
 
-    if [ ${#path_parts[@]} -eq "$count" ]; then
+    # The remainder is sliced out of the original string, not rebuilt from
+    # components, so an interior `//` renders as the binary renders it.
+    local tail=$path
+    [ "$count" -gt 0 ] && tail=${path:path_ends[count-1]}
+    trim_path_ends "$tail"
+    if [ -z "$R" ]; then
         R='~'
-        return
+    else
+        # shellcheck disable=SC2088 # a literal tilde is the point: this is
+        # display text, not a path to be resolved
+        R="~/$R"
     fi
-    local IFS='/'
-    R="~/${path_parts[*]:count}"
 }
 
 
@@ -651,26 +730,33 @@ git_locate() {
     fi
     path_split "$start"
 
-    local -a parts=("${PATH_PARTS[@]}")
-    local -a rest=()
-    local dir
+    # The walk shortens a prefix of the original string rather than rebuilding
+    # a path from components, mirroring `PathBuf::pop`: that is what makes
+    # `GIT_ROOT` and the relative remainder below spell interior separators the
+    # way the binary spells them.
+    local -a ends=("${PATH_ENDS[@]}")
+    local depth=${#PATH_PARTS[@]} dir
     while :; do
-        join_abs "${parts[@]}"
-        dir=$R
+        if [ "$depth" -eq 0 ]; then
+            dir='/'
+        else
+            dir=${start:0:ends[depth-1]}
+        fi
         if resolve_git_dir "$dir/.git"; then
             GIT_DIR=$R
             GIT_ROOT=$dir
             break
         fi
-        [ ${#parts[@]} -eq 0 ] && return 1
-        rest=("${parts[@]: -1}" "${rest[@]}")
-        unset "parts[${#parts[@]}-1]"
-        parts=("${parts[@]}")
+        [ "$depth" -eq 0 ] && return 1
+        depth=$((depth - 1))
     done
 
-    if [ ${#rest[@]} -gt 0 ]; then
-        local IFS='/'
-        GIT_REL_PATH="${rest[*]}"
+    if [ "$depth" -gt 0 ]; then
+        trim_path_ends "${start:ends[depth-1]}"
+        GIT_REL_PATH=$R
+    else
+        trim_path_ends "$start"
+        GIT_REL_PATH=$R
     fi
 
     if read_head "$GIT_DIR/HEAD"; then
@@ -889,6 +975,8 @@ declare -A P=()
 # parsed value: `serde` rejects `949.0` for a `u64` field, and a parsed double
 # cannot tell that from `949`. The same trick keeps the `u64::MAX` bound exact,
 # by comparing 20-digit literals as strings rather than as doubles.
+# shellcheck disable=SC2016 # single quotes are deliberate: this is a jq program,
+# and every `$name` in it is a jq variable, not a shell one
 PAYLOAD_JQ='
 def is_str: type == "string";
 def is_f64: type == "number";
@@ -1167,7 +1255,7 @@ row_tokens() {
     bold "$R"
     value=$R
     delta "${P[turn_in]}"
-    value+=$R
+    value+="$R"
     labeled_field 'IN ' "$value"
     out=$R
 
@@ -1175,7 +1263,7 @@ row_tokens() {
     role danger 1 "$R"
     value=$R
     delta "${P[turn_out]}"
-    value+=$R
+    value+="$R"
     labeled_field 'OUT ' "$value"
     out+=" $R"
 
@@ -1185,11 +1273,11 @@ row_tokens() {
         role warning 0 "+$R"
         value=$R
         dim ' / '
-        value+=$R
+        value+="$R"
     fi
     fmt_compact "${P[cache_read]}"
     role success 0 "$R"
-    value+=$R
+    value+="$R"
     labeled_field 'CACHE ' "$value"
     R="$out $R"
 }
@@ -1251,20 +1339,20 @@ row_where_repo() {
     fi
 
     role punctuation 0 '~'
-    out+=$R
+    out+="$R"
     role owner 0 "$owner"
-    out+=$R
+    out+="$R"
     role divider 0 '/'
-    out+=$R
+    out+="$R"
     role repo 0 "$repo"
-    out+=$R
+    out+="$R"
     role punctuation 0 '.git'
-    out+=$R
+    out+="$R"
 
     local at_root=0
     [ -z "$rel" ] && at_root=1
     role path_marker "$at_root" ':/'
-    out+=$R
+    out+="$R"
 
     if [ "$at_root" = 0 ]; then
         local -a segments=()
@@ -1273,12 +1361,12 @@ row_where_repo() {
         for ((i = 0; i <= last; i++)); do
             if [ "$i" -lt "$last" ]; then
                 role directory 0 "${segments[i]}"
-                out+=$R
+                out+="$R"
                 role punctuation 0 '/'
-                out+=$R
+                out+="$R"
             else
                 role path 0 "${segments[i]}"
-                out+=$R
+                out+="$R"
             fi
         done
     fi
