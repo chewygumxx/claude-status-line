@@ -1086,3 +1086,339 @@ settings_effort_level() {
           else "" end
     ' 2>/dev/null) || R=''
 }
+
+
+# ---------------------------------------------------------------------------
+# render: port of `src/render.rs`
+#
+# Both row assembly and the two shared primitives live here, `bracketed` and
+# `separator`, so that (as that module's comment puts it) there is exactly one
+# implementation of "put dim brackets around this" to maintain rather than the
+# two byte-identical copies the original Python script accumulated.
+# ---------------------------------------------------------------------------
+
+# Wraps `$1` in dim brackets.
+bracketed() {
+    local inner=$1 open close
+    dim '['
+    open=$R
+    dim ']'
+    close=$R
+    R="${open}${inner}${close}"
+}
+
+# The dim ` · ` separator between row fields (U+00B7).
+separator() {
+    dim $' · '
+}
+
+# One bracketed usage gauge: label, percentage, and optional reset time.
+gauge_field() {
+    local label=$1 display=$2 severity=$3 reset=$4 inner pct_text
+    if [ "$display" = '?' ]; then
+        pct_text='?'
+    else
+        pct_text="${display}%"
+    fi
+    role muted 0 "$label"
+    inner=$R
+    role "$severity" 1 "$pct_text"
+    inner+=" $R"
+    if [ -n "$reset" ]; then
+        role muted 0 "$reset"
+        inner+=" $R"
+    fi
+    bracketed "$inner"
+}
+
+# Row: context-window, five-hour, and seven-day usage gauges.
+row_limits() {
+    local out
+    gauge_field CTX "${P[ctx_display]}" "${P[ctx_role]}" ''
+    out=$R
+    gauge_field 5H "${P[five_display]}" "${P[five_role]}" "$FIVE_RESET"
+    out+=" $R"
+    gauge_field 7D "${P[seven_display]}" "${P[seven_role]}" "$SEVEN_RESET"
+    R="$out $R"
+}
+
+# The ` +N` per-turn delta, empty when the turn contributed nothing.
+delta() {
+    local n=$1
+    R=''
+    [ "$n" = 0 ] && return
+    fmt_commas "$n"
+    role muted 0 "+$R"
+    R=" $R"
+}
+
+# One bracketed `<label><value>` field.
+labeled_field() {
+    local label=$1 value=$2
+    role muted 0 "$label"
+    bracketed "${R}${value}"
+}
+
+# Row: input and output totals with per-turn deltas, plus cache usage.
+row_tokens() {
+    local out value
+
+    fmt_compact "${P[total_in]}"
+    bold "$R"
+    value=$R
+    delta "${P[turn_in]}"
+    value+=$R
+    labeled_field 'IN ' "$value"
+    out=$R
+
+    fmt_compact "${P[total_out]}"
+    role danger 1 "$R"
+    value=$R
+    delta "${P[turn_out]}"
+    value+=$R
+    labeled_field 'OUT ' "$value"
+    out+=" $R"
+
+    value=''
+    if [ "${P[cache_write]}" != 0 ]; then
+        fmt_compact "${P[cache_write]}"
+        role warning 0 "+$R"
+        value=$R
+        dim ' / '
+        value+=$R
+    fi
+    fmt_compact "${P[cache_read]}"
+    role success 0 "$R"
+    value+=$R
+    labeled_field 'CACHE ' "$value"
+    R="$out $R"
+}
+
+# The colour role for an effort level.
+effort_role() {
+    case $1 in
+        LOW) R=effort_low ;;
+        MEDIUM) R=warning ;;
+        HIGH) R=effort_high ;;
+        MAX) R=danger ;;
+        *) R=muted ;;
+    esac
+}
+
+# Row: model name and effort level, joined by a plain space. The dim separator
+# that follows is appended by `render_payload`, not here.
+row_config() {
+    local model=$1 effort=$2 out
+    role model 0 "$model"
+    out=$R
+    effort_role "$effort"
+    role "$R" 1 "$effort"
+    R="$out $R"
+}
+
+# Row: the home-shortened working directory, when not inside a repository.
+row_where_pwd() {
+    shorten_home "$1"
+    role path 0 "$R"
+}
+
+# Row: `[!]<count> <branch> ~<owner>/<repo>.git:/<path>` inside a repository.
+#
+# The branch is shown for every branch it can resolve, `main` included, and the
+# `:/` marker is always shown, bold when the working directory *is* the
+# repository root. The counter is omitted when there is nothing to report.
+# Per-token colours follow `.claude/reference/where_row_colors.md`.
+row_where_repo() {
+    local branch=$1 owner=$2 repo=$3 rel=$4 has_counter=$5 count=$6 unpushed=$7
+    local out='' severity text
+
+    if [ "$has_counter" = 1 ]; then
+        if [ "$unpushed" = 1 ] || [ "$count" -gt 0 ]; then
+            severity=warning
+        else
+            severity=muted
+        fi
+        text=''
+        [ "$unpushed" = 1 ] && text='!'
+        text+=$count
+        role "$severity" 0 "$text"
+        out+="$R "
+    fi
+
+    if [ -n "$branch" ]; then
+        role branch 0 "$branch"
+        out+="$R "
+    fi
+
+    role punctuation 0 '~'
+    out+=$R
+    role owner 0 "$owner"
+    out+=$R
+    role divider 0 '/'
+    out+=$R
+    role repo 0 "$repo"
+    out+=$R
+    role punctuation 0 '.git'
+    out+=$R
+
+    local at_root=0
+    [ -z "$rel" ] && at_root=1
+    role path_marker "$at_root" ':/'
+    out+=$R
+
+    if [ "$at_root" = 0 ]; then
+        local -a segments=()
+        IFS='/' read -ra segments <<<"$rel"
+        local i last=$((${#segments[@]} - 1))
+        for ((i = 0; i <= last; i++)); do
+            if [ "$i" -lt "$last" ]; then
+                role directory 0 "${segments[i]}"
+                out+=$R
+                role punctuation 0 '/'
+                out+=$R
+            else
+                role path 0 "${segments[i]}"
+                out+=$R
+            fi
+        done
+    fi
+
+    R=$out
+}
+
+
+# ---------------------------------------------------------------------------
+# main: port of `src/lib.rs` and `src/main.rs`
+# ---------------------------------------------------------------------------
+
+# Rate-limit reset strings, shared with `row_limits`.
+FIVE_RESET=''
+SEVEN_RESET=''
+
+# Echoes `$1`, or `$2` when `$1` is empty.
+#
+# The fallback chains in `src/lib.rs` route through its `non_empty` so that an
+# explicit `""` falls through just as a missing key does, which is what the
+# original Python script's `or` chains did. Same idea, and in bash it is simply
+# what `[ -z ]` already means.
+first_non_empty() {
+    if [ -n "$1" ]; then R=$1; else R=$2; fi
+}
+
+# Renders both lines for the already-parsed payload in `P`.
+render_payload() {
+    local cwd model_name effort now
+
+    first_non_empty "${P[cwd]}" "${P[cwd_fallback]}"
+    cwd=$R
+    if [ -z "$cwd" ]; then
+        process_cwd
+        cwd=$R
+    fi
+
+    first_non_empty "${P[model_name]}" "${P[model_id]}"
+    model_name=$R
+    [ -z "$model_name" ] && model_name='?'
+
+    # The payload's own `effort.level` is Claude Code's fully resolved live
+    # value, so it wins outright; the settings cascade only covers older
+    # versions that do not send it.
+    effort=${P[effort]}
+    if [ -z "$effort" ] && [ -n "${P[model_id]}" ]; then
+        settings_effort_level "$cwd" "${P[model_id]}"
+        effort=$R
+    fi
+    [ -z "$effort" ] && effort='?'
+    # DIVERGENCE: `${var^^}` is effectively ASCII, where Rust's `to_uppercase`
+    # is Unicode-aware. Effort levels are ASCII keywords, so this only shows on
+    # a payload that invents a non-ASCII one.
+    effort=${effort^^}
+
+    now_seconds
+    now=$R
+    fmt_reset "${P[five_reset]}" "$now"
+    FIVE_RESET=$R
+    fmt_reset "${P[seven_reset]}" "$now"
+    SEVEN_RESET=$R
+
+    local where owner repo has_counter=0
+    if git_locate "$cwd"; then
+        owner=$GIT_OWNER
+        [ -z "$owner" ] && owner='chewygumxx'
+        repo=$GIT_REPO
+        if [ -z "$repo" ]; then
+            path_split "$GIT_ROOT"
+            repo=''
+            [ ${#PATH_PARTS[@]} -gt 0 ] && repo=${PATH_PARTS[-1]}
+        fi
+        repo_status_query "$GIT_ROOT" "$GIT_BRANCH" "${P[session_id]}"
+        if [ "$STATUS_AVAILABLE" = 1 ] &&
+            { [ "$STATUS_DIRTY" -gt 0 ] || [ "$STATUS_UNPUSHED" = 1 ]; }; then
+            has_counter=1
+        fi
+        row_where_repo "$GIT_BRANCH" "$owner" "$repo" "$GIT_REL_PATH" \
+            "$has_counter" "$STATUS_DIRTY" "$STATUS_UNPUSHED"
+    else
+        row_where_pwd "$cwd"
+    fi
+    where=$R
+
+    local config tokens limits sep
+    row_config "$model_name" "$effort"
+    config=$R
+    row_tokens
+    tokens=$R
+    row_limits
+    limits=$R
+    separator
+    sep=$R
+
+    printf '%s\n%s%s%s %s\n' "$where" "$config" "$sep" "$tokens" "$limits"
+}
+
+# Reads the payload from `--sample <file>` when given and stdin otherwise, then
+# renders. `--no-color` forces plain output; unrecognized arguments are ignored,
+# as they are by the Rust `parse_args`.
+main() {
+    local sample='' no_color=0 raw
+
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --sample)
+                shift
+                sample=${1-}
+                ;;
+            --no-color) no_color=1 ;;
+        esac
+        shift
+    done
+
+    if [ -n "$sample" ]; then
+        # DIVERGENCE: the wording after the path is bash's business rather than
+        # Rust's `std::io::Error`; the stream and the exit status match.
+        if [ -d "$sample" ] || [ ! -r "$sample" ]; then
+            printf "claude-status-line: couldn't read %s\n" "$sample" >&2
+            return 1
+        fi
+        raw=$(<"$sample")
+    else
+        # An unreadable or empty stdin still leaves a valid (empty) payload,
+        # which renders as the all-defaults status line rather than an error.
+        IFS= read -r -d '' raw <&0
+    fi
+
+    if [ "$no_color" = 1 ]; then
+        TIER='plain'
+    else
+        detect_tier
+    fi
+
+    payload_parse "$raw"
+    render_payload
+}
+
+# Only run when executed, so that `tests/compare-with-rust.sh` (and any other
+# caller) can source this file to exercise individual functions.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
