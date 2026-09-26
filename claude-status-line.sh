@@ -860,3 +860,229 @@ repo_status_write_cache() {
     fi
     printf '%s' "$payload" >"$path" 2>/dev/null || true
 }
+
+
+# ---------------------------------------------------------------------------
+# payload: port of `src/payload.rs` and `src/format/gauge.rs`
+# ---------------------------------------------------------------------------
+
+# Parsed payload fields, keyed by the names the `jq` program below emits.
+declare -A P=()
+
+# The `jq` program. It does three jobs that have to happen together:
+#
+#  1. Validates the payload against `src/payload.rs`'s schema, and substitutes
+#     an empty object for the whole payload if anything fails. That looks
+#     heavy-handed, and it is: `serde` gives up on the entire document over one
+#     ill-typed field, so `{"model":{"display_name":"M"},"cost":{...:"x"}}`
+#     renders no model name at all under the binary. Validating field by field
+#     here would be *more* forgiving than the program being ported, which is
+#     just as wrong as being less forgiving.
+#  2. Distinguishes a missing key (fine: every leaf is an `Option`) from a
+#     present but ill-typed one, and an explicit `null` at a leaf (fine) from an
+#     explicit `null` where a nested struct belongs (not fine: `#[serde(default)]`
+#     only covers absence).
+#  3. Computes each percentage gauge, because `jq`'s `round` is C `round()`,
+#     which breaks ties away from zero exactly as Rust's `f64::round` does.
+#
+# Type checks run against `tojson`, the number's *original literal*, not its
+# parsed value: `serde` rejects `949.0` for a `u64` field, and a parsed double
+# cannot tell that from `949`. The same trick keeps the `u64::MAX` bound exact,
+# by comparing 20-digit literals as strings rather than as doubles.
+PAYLOAD_JQ='
+def is_str: type == "string";
+def is_f64: type == "number";
+def is_u64:
+    type == "number"
+    and (tojson | test("^[0-9]+$"))
+    and (tojson | length as $n | $n < 20 or ($n == 20 and . <= "18446744073709551615"));
+def is_i64:
+    type == "number"
+    and (tojson | test("^-?[0-9]+$"))
+    and (length <= 9223372036854775807);
+
+# An absent key is always acceptable; a present one must be null or valid.
+def leaf(name; f): if has(name) then (.[name] | . == null or f) else true end;
+# A present nested struct must be an object: an explicit null is a serde error.
+def nested(name; f): if has(name) then (.[name] | type == "object" and f) else true end;
+
+def valid:
+    type == "object"
+    and leaf("cwd"; is_str)
+    and leaf("session_id"; is_str)
+    and nested("workspace"; leaf("current_dir"; is_str))
+    and nested("model"; leaf("display_name"; is_str) and leaf("id"; is_str))
+    and nested("effort"; leaf("level"; is_str))
+    and nested("cost"; leaf("total_duration_ms"; is_i64))
+    and nested("context_window";
+        leaf("used_percentage"; is_f64)
+        and leaf("total_input_tokens"; is_u64)
+        and leaf("total_output_tokens"; is_u64)
+        and nested("current_usage";
+            leaf("input_tokens"; is_u64)
+            and leaf("output_tokens"; is_u64)
+            and leaf("cache_creation_input_tokens"; is_u64)
+            and leaf("cache_read_input_tokens"; is_u64)))
+    and nested("rate_limits";
+        nested("five_hour"; leaf("used_percentage"; is_f64) and leaf("resets_at"; is_i64))
+        and nested("seven_day"; leaf("used_percentage"; is_f64) and leaf("resets_at"; is_i64)));
+
+# A rounded percentage and its severity role, or "?" / muted when unusable.
+# Adding zero normalizes the -0.0 that rounding a small negative produces, which
+# is in range (so it renders as 0%) but must not print as "-0".
+def gauge:
+    if type != "number" or isinfinite or isnan then
+        {display: "?", role: "muted"}
+    else
+        (round) as $r
+        | if $r >= 0 and $r <= 255 then
+            ($r + 0) as $d
+            | {display: ($d | tostring),
+               role: (if $d < 50 then "success" elif $d < 80 then "warning" else "danger" end)}
+          else
+            {display: "?", role: "muted"}
+          end
+    end;
+
+def count: if . == null then "0" else tojson end;
+def epoch: if . == null then "" else tojson end;
+def text: if . == null then "" else . end;
+def emit(k; v): "\(k)=\(v)\u0000";
+
+(if valid then . else {} end)
+| (.context_window // {}) as $cw
+| ($cw.current_usage // {}) as $cu
+| (.rate_limits // {}) as $rl
+| ($rl.five_hour // {}) as $five
+| ($rl.seven_day // {}) as $seven
+| ($cw.used_percentage | gauge) as $ctx
+| ($five.used_percentage | gauge) as $fiveg
+| ($seven.used_percentage | gauge) as $seveng
+| emit("cwd"; .workspace.current_dir | text)
++ emit("cwd_fallback"; .cwd | text)
++ emit("model_name"; .model.display_name | text)
++ emit("model_id"; .model.id | text)
++ emit("effort"; .effort.level | text)
++ emit("session_id"; .session_id | text)
++ emit("total_in"; $cw.total_input_tokens | count)
++ emit("total_out"; $cw.total_output_tokens | count)
++ emit("turn_in"; $cu.input_tokens | count)
++ emit("turn_out"; $cu.output_tokens | count)
++ emit("cache_write"; $cu.cache_creation_input_tokens | count)
++ emit("cache_read"; $cu.cache_read_input_tokens | count)
++ emit("ctx_display"; $ctx.display)
++ emit("ctx_role"; $ctx.role)
++ emit("five_display"; $fiveg.display)
++ emit("five_role"; $fiveg.role)
++ emit("five_reset"; $five.resets_at | epoch)
++ emit("seven_display"; $seveng.display)
++ emit("seven_role"; $seveng.role)
++ emit("seven_reset"; $seven.resets_at | epoch)
+'
+
+# The field values a payload that parses to nothing produces, used when `jq` is
+# absent or the payload is not JSON at all.
+payload_defaults() {
+    P=(
+        [cwd]='' [cwd_fallback]='' [model_name]='' [model_id]='' [effort]=''
+        [session_id]='' [total_in]=0 [total_out]=0 [turn_in]=0 [turn_out]=0
+        [cache_write]=0 [cache_read]=0
+        [ctx_display]='?' [ctx_role]=muted
+        [five_display]='?' [five_role]=muted [five_reset]=''
+        [seven_display]='?' [seven_role]=muted [seven_reset]=''
+    )
+}
+
+# Parses raw payload `$1` into `P`.
+#
+# DIVERGENCE: the Rust binary is self-contained, where this needs `jq`. Rather
+# than fail, a missing `jq` degrades to the same output an unparseable payload
+# gives, consistent with the program's "a degraded status line beats no status
+# line" stance.
+payload_parse() {
+    local raw=$1 entry key
+    payload_defaults
+    command -v jq >/dev/null 2>&1 || return 0
+
+    # `< <(...)` rather than a pipe: a pipeline would run this loop in a
+    # subshell and `P` would be discarded when it exited.
+    while IFS= read -r -d '' entry; do
+        key=${entry%%=*}
+        P[$key]=${entry#*=}
+    done < <(printf '%s' "$raw" | jq -j -r "$PAYLOAD_JQ" 2>/dev/null)
+}
+
+
+# ---------------------------------------------------------------------------
+# config: port of `src/config.rs`
+# ---------------------------------------------------------------------------
+
+# The settings cascade, consulted only when the payload carries no
+# `effort.level`: project-local overrides beat the committed project file, which
+# beats the user-wide one.
+settings_candidates() {
+    local cwd=$1
+    SETTINGS_FILES=("$cwd/.claude/settings.local.json" "$cwd/.claude/settings.json")
+    # `dirs::home_dir()` is `$HOME` here, so this deliberately reads
+    # `~/.claude/settings.json` and not `$CLAUDE_CONFIG_DIR`, exactly as the
+    # Rust version does.
+    [ -n "${HOME-}" ] && SETTINGS_FILES+=("$HOME/.claude/settings.json")
+}
+declare -a SETTINGS_FILES=()
+
+# Merges the cascade and resolves the effort level for model id `$2`, searching
+# `modelSettings.<id>.effortLevel` before the top-level `effortLevel` default.
+#
+# The merge keeps the first *truthy* value for each leaf rather than the first
+# present one, and descends into nested objects, so a higher-priority file that
+# sets `effortLevel` to `""` (or merely mentions the model under
+# `modelSettings`) does not shadow a real value further down. That is the
+# original Python script's `if v: return v` behaviour, generalized per leaf.
+settings_effort_level() {
+    local cwd=$1 model_id=$2
+    R=''
+    command -v jq >/dev/null 2>&1 || return 0
+
+    settings_candidates "$cwd"
+    local -a args=()
+    local file i contents
+    # Always three `--arg`s, even when `$HOME` is unset and there are only two
+    # candidate files: `jq` fails on a reference to an undefined variable.
+    for ((i = 0; i < 3; i++)); do
+        contents=''
+        file=${SETTINGS_FILES[i]-}
+        # Files are read here rather than by `jq` so that an unreadable one is
+        # skipped as silently as a malformed one.
+        [ -n "$file" ] && [ -r "$file" ] && contents=$(<"$file")
+        args+=(--arg "s$i" "$contents")
+    done
+
+    R=$(jq -n -r --arg model "$model_id" "${args[@]}" '
+        def truthy: . != null and . != false and . != "" and . != 0 and . != [] and . != {};
+        def parsed: if . == "" then null else (try fromjson catch null) end
+            | if type == "object" then . else null end;
+        def mergeinto($inc):
+            reduce ($inc | keys_unsorted[]) as $k (.;
+                if (has($k) | not) then
+                    .[$k] = $inc[$k]
+                elif (.[$k] | type == "object") and ($inc[$k] | type == "object") then
+                    .[$k] |= mergeinto($inc[$k])
+                elif (.[$k] | truthy) then
+                    .
+                elif ($inc[$k] | truthy) then
+                    .[$k] = $inc[$k]
+                else
+                    .
+                end);
+        [$s0, $s1, $s2] | map(parsed) | map(select(. != null)) as $files
+        | reduce $files[] as $f ({}; mergeinto($f))
+        # Each step checks the type before descending: Rust reaches these
+        # through `Value::get`, which returns `None` rather than failing when
+        # the value in the way is not an object.
+        | ((.modelSettings | if type == "object" then .[$model] else null end
+            | if type == "object" then .effortLevel else null end)) as $per_model
+        | if ($per_model | type) == "string" then $per_model
+          elif (.effortLevel | type) == "string" then .effortLevel
+          else "" end
+    ' 2>/dev/null) || R=''
+}
