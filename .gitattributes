@@ -1,0 +1,16 @@
+# vim:set expandtab shiftwidth=4 filetype=gitattributes:
+# SPDX-License-Identifier: GPL-3.0-only
+
+#
+#
+# ~chewygumxx/claude-status-line.git
+# ::: :/.gitattributes
+#
+#
+
+# Every checkout is byte-identical, on every platform. Without this, the
+# Windows release runner checks LICENSE out with CRLF line endings, so the
+# same licence ships with a different checksum in the Windows archives than
+# in the unix ones. It would do the same to claude-status-line.sh, which is a
+# rather more serious matter for anyone running it under WSL or MSYS.
+* -text
