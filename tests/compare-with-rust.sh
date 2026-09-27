@@ -56,6 +56,7 @@ fi
 
 PASS=0
 FAIL=0
+SKIP=0
 
 # A scratch area for the synthetic repositories and settings trees below, so no
 # case has to touch this checkout.
@@ -580,6 +581,81 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# 9. Platform fallbacks
+#
+# Two paths in the script only run on machines this suite is rarely run on.
+# Left to themselves they would rot, so both are reached deliberately here.
+# ---------------------------------------------------------------------------
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+# 9a. `load_true_env` without `/proc`, which is the macOS and BSD path.
+#
+# Colour detection is the only thing that depends on reading the real
+# environment rather than the shell's own variables, so the tier cases are what
+# is worth re-running against it.
+noproc="$WORK/no-proc.sh"
+sed 's:if \[ -r /proc/self/environ \]; then:if false; then:' \
+    "$BASH_IMPL" > "$noproc"
+if grep -q 'if false; then' "$noproc"; then
+    chmod +x "$noproc"
+    real_impl=$BASH_IMPL
+    BASH_IMPL=$noproc
+    CASE_CLEAN=1
+    for spec in '' 'TERM=' 'TERM=dumb' 'TERM=xterm-256color' \
+        'TERM=xterm-truecolor' 'COLORTERM=truecolor' 'COLORTERM=' 'CI=true' \
+        'CI=' 'GITHUB_ACTION=__run' 'CLICOLOR=1' 'FORCE_COLOR=2' 'NO_COLOR=1'; do
+        # shellcheck disable=SC2206 # deliberate word splitting of the case spec
+        CASE_ENV=("HOME=$HERMETIC_HOME" ${spec})
+        compare "no-/proc fallback [${spec:-unset}]" "$tier_payload"
+    done
+    CASE_CLEAN=0
+    BASH_IMPL=$real_impl
+else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  could not reach the no-/proc fallback: the %s anchor moved\n' \
+        'load_true_env'
+fi
+
+# 9b. The bash 3.2 re-exec, which is the macOS path: `/bin/bash` there is 3.2,
+# and the script is expected to hand itself to a newer bash rather than run on
+# it. Skipped where no such bash exists, which is to say on most Linux boxes.
+old_bash=''
+for candidate in /bin/bash /usr/bin/bash /bin/sh; do
+    [ -x "$candidate" ] || continue
+    # shellcheck disable=SC2016 # the candidate shell expands this, not this one
+    major=$("$candidate" -c 'printf %s "${BASH_VERSINFO[0]}"' 2> /dev/null)
+    case $major in
+        [0-9]*)
+            if [ "$major" -lt 4 ]; then
+                old_bash=$candidate
+                break
+            fi
+            ;;
+    esac
+done
+if [ -n "$old_bash" ]; then
+    wrapper="$WORK/via-old-bash"
+    printf '#!/bin/sh\nexec %s %s "$@"\n' "$old_bash" "$BASH_IMPL" > "$wrapper"
+    chmod +x "$wrapper"
+    real_impl=$BASH_IMPL
+    BASH_IMPL=$wrapper
+    for fixture in "$REPO_ROOT"/tests/fixtures/*.json; do
+        name=$(basename -- "$fixture" .json)
+        CASE_ENV=("HOME=$HERMETIC_HOME" 'FORCE_COLOR=3')
+        compare "re-exec from $old_bash ($name)" "$(<"$fixture")"
+    done
+    BASH_IMPL=$real_impl
+else
+    SKIP=$((SKIP + 1))
+    [ "$VERBOSE" = 1 ] &&
+        printf 'skip  no bash older than 4 on this machine to re-exec from\n'
+fi
+
+
+# ---------------------------------------------------------------------------
+
+if [ "$SKIP" != 0 ]; then
+    printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+else
+    printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+fi
 [ "$FAIL" = 0 ]
