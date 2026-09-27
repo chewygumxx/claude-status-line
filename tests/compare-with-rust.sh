@@ -28,7 +28,10 @@
 set -uo pipefail
 
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-BASH_IMPL="$REPO_ROOT/claude-status-line.sh"
+# Overridable so a variant of the script can be put through the same suite:
+# the `load_true_env` fallback for platforms without `/proc`, for instance, is
+# otherwise unreachable on the platform most of these runs happen on.
+BASH_IMPL=${CLAUDE_STATUS_LINE_SH:-$REPO_ROOT/claude-status-line.sh}
 VERBOSE=0
 [ "${1-}" = '-v' ] && VERBOSE=1
 
