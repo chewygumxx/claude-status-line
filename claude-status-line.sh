@@ -405,13 +405,10 @@ fmt_compact() {
 # `from_unix_timestamp` fails outside them, and `src/format/time.rs` renders an
 # empty string for that failure.
 #
-# DIVERGENCE: right at those bounds the two implementations part company, and
-# not in this script's favour to fix. `src/format/time.rs:33` applies the local
-# offset with `to_offset`, which *panics* when the shifted value leaves the valid
-# range, so the binary aborts the whole render (printing nothing at all) for
-# `resets_at: 253402300799` in any zone east of UTC. This script renders the
-# time instead. Reproducing the panic would mean deliberately discarding a
-# status line the binary only fails to print because of a bug.
+# The bounds are checked twice, once before the local offset is applied and
+# once after, because `checked_to_offset` can fail where
+# `from_unix_timestamp` succeeded: an epoch within one offset of the ceiling
+# is representable in UTC and not representable an hour east of it.
 EPOCH_MIN=-377705116800
 EPOCH_MAX=253402300799
 
@@ -458,13 +455,22 @@ fmt_reset() {
 
     local fields hour minute weekday
     local_offset_seconds
+    # `checked_to_offset`'s failure case: representable before the shift, off
+    # the end of the calendar after it. `R` carries the offset in at this
+    # point, so it has to go back to the empty return value before any early
+    # exit, or the offset itself ends up rendered as the reset time.
+    local shifted=$((epoch + R))
+    R=''
+    if [ "$shifted" -lt "$EPOCH_MIN" ] || [ "$shifted" -gt "$EPOCH_MAX" ]; then
+        return
+    fi
     # `date -d @<epoch>` would apply the offset in force *at that instant*,
     # including historical and daylight-saving changes. Rust reads one offset
     # (`UtcOffset::current_local_offset`, the offset right now) and applies it to
     # every timestamp, so a reset on the far side of a daylight-saving boundary
     # renders an hour off what `date` would say. Shifting the epoch and
     # formatting in UTC reproduces Rust's arithmetic instead of correcting it.
-    fields=$(LC_ALL=C date -u -d "@$((epoch + R))" '+%H %M %a' 2>/dev/null) || return
+    fields=$(LC_ALL=C date -u -d "@$shifted" '+%H %M %a' 2>/dev/null) || return
     read -r hour minute weekday <<<"$fields"
     [ -z "$hour" ] && return
 
