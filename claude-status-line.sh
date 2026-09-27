@@ -21,7 +21,10 @@
 # are deliberate, unavoidable, and commented individually; grep for
 # "DIVERGENCE".
 #
-# Requires: bash 4+ (associative arrays), jq, GNU coreutils `date`, git.
+# Requires: bash 4+ (associative arrays), jq, git, and a `date` supporting
+# `+%z` and `+%s`, which both the GNU and the BSD one do. Linux, macOS and the
+# BSDs are all covered; see `load_true_env` for the one place where the
+# non-Linux path is a best effort rather than an exact match.
 #
 # Note there is deliberately no `set -e` / `set -u` / `set -o pipefail` here.
 # The Rust program never fails outright: a malformed payload, an unreadable
@@ -29,6 +32,28 @@
 # line rather than an error, on the grounds that a status line wrong in a few
 # fields beats a crash that shows nothing. Aborting this script on the first
 # non-zero exit status or unset variable would throw that property away.
+
+# bash 4 is a hard requirement (the palette below is an associative array, and
+# the effort level is uppercased with `${var^^}`), and macOS still ships bash
+# 3.2 as `/bin/bash`. A newer bash installed alongside it is usually reachable,
+# so prefer re-execing into one over failing: this is the status line, and the
+# person who configured it is not watching a terminal for an error message.
+#
+# The marker variable makes the re-exec unrepeatable, so a candidate that turns
+# out to be old too reports the problem rather than looping. Nothing has read
+# stdin yet at this point, so the payload survives the `exec` untouched.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    if [ -z "${CLAUDE_STATUS_LINE_REEXEC-}" ]; then
+        export CLAUDE_STATUS_LINE_REEXEC=1
+        for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash \
+            /usr/pkg/bin/bash /opt/local/bin/bash; do
+            [ -x "$candidate" ] && exec "$candidate" "$0" "$@"
+        done
+    fi
+    printf 'claude-status-line: needs bash 4 or newer, found %s\n' \
+        "${BASH_VERSION:-no bash at all}" >&2
+    exit 1
+fi
 
 # String-returning helpers below assign to the global `R` rather than writing
 # to stdout for a caller to capture. A single render calls them upwards of
@@ -120,10 +145,12 @@ ENV_TRUE_LOADED=0
 # is what keeps "no TERM, but COLORTERM=truecolor" rendering in truecolour here
 # exactly as it does under the binary.
 #
-# `/proc/self/environ` is Linux-only, matching this script's other GNU
-# assumptions. Where it isn't readable, the shell's own variables are used as a
-# fallback, which reintroduces the injected-`TERM` difference above in that one
-# case only.
+# `/proc/self/environ` is Linux-only, and is preferred where it exists: it is
+# NUL-delimited, so it is exact, and reading a file costs no fork. Elsewhere
+# (macOS, the BSDs) `env` serves the same purpose at the cost of one fork,
+# since a child process is handed precisely the exported variables and none of
+# the shell's own. Failing both, the shell's variables are used, which
+# reintroduces the injected-`TERM` difference above in that one case only.
 load_true_env() {
     ENV_TRUE=()
     local entry
@@ -135,6 +162,32 @@ load_true_env() {
                 *=*) ENV_TRUE[${entry%%=*}]=${entry#*=} ;;
             esac
         done < /proc/self/environ
+        ENV_TRUE_LOADED=1
+    elif command -v env > /dev/null 2>&1; then
+        # DIVERGENCE (non-Linux only): `env` separates entries with newlines,
+        # so a value that itself contains one is ambiguous. A line whose name
+        # part holds whitespace cannot be the start of an entry, so it is
+        # rejoined onto the previous value; a contrived value whose second line
+        # reads like `NAME=value` would still be split. Nothing the tier and
+        # settings lookups read is plausibly multi-line, and `/proc` covers the
+        # platform where the status line actually runs.
+        local name=''
+        while IFS= read -r entry; do
+            case $entry in
+                *=*)
+                    case ${entry%%=*} in
+                        *[[:space:]]*)
+                            [ -n "$name" ] && ENV_TRUE[$name]+=$'\n'$entry
+                            ;;
+                        *)
+                            name=${entry%%=*}
+                            ENV_TRUE[$name]=${entry#*=}
+                            ;;
+                    esac
+                    ;;
+                *) [ -n "$name" ] && ENV_TRUE[$name]+=$'\n'$entry ;;
+            esac
+        done < <(env 2> /dev/null)
         ENV_TRUE_LOADED=1
     fi
 }
