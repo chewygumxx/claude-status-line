@@ -335,7 +335,11 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(&git_dir).unwrap();
         fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        fs::write(git_dir.join("config"), "[core]\n\trepositoryformatversion = 0\n").unwrap();
+        fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
 
         let info = locate(&root).expect("expected a located repo");
         assert_eq!(info.owner, None);

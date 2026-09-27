@@ -349,7 +349,10 @@ mod tests {
             Tier::Plain,
             Where::Repo(repo_loc(Some("main"), "src/render.rs")),
         );
-        assert_eq!(out, "main ~chewygumxx/claude-status-line.git:/src/render.rs");
+        assert_eq!(
+            out,
+            "main ~chewygumxx/claude-status-line.git:/src/render.rs"
+        );
     }
 
     #[test]
