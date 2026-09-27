@@ -373,13 +373,21 @@ for spec in "${reset_cases[@]}"; do
     compare "reset [$spec]" "$(reset_payload "${spec% *}" "${spec#* }")"
 done
 
-# The representable-range bounds are checked in UTC specifically. Anywhere east
-# of UTC the binary panics within one offset's distance of the upper bound, not
-# merely at it, so a zone with a positive offset cannot test the bound itself.
-# Section 8 pins that panic down separately.
-for spec in "253402300799 253402300800" "-377705116800 -377705116801"; do
-    CASE_ENV=("HOME=$HERMETIC_HOME" 'FORCE_COLOR=3' 'TZ=UTC')
-    compare "reset bound in UTC [$spec]" "$(reset_payload "${spec% *}" "${spec#* }")"
+# The representable-range bounds, in a zone on each side of UTC as well as in
+# UTC itself. Applying the local offset can carry a timestamp that
+# `from_unix_timestamp` accepted off the end of the calendar, so the interesting
+# band is one offset wide and sits just inside each bound, not exactly on it:
+# the eastern zone below cannot render the maximum, the western one cannot
+# render the minimum, and both must decline in the same way the binary does
+# rather than either one guessing. Section 8 asserts the binary declines by
+# rendering nothing rather than by aborting.
+for tz in UTC Australia/Sydney America/Los_Angeles; do
+    for spec in "253402300799 253402300800" "253402264799 253402264800" \
+        "-377705116800 -377705116801" "-377705080800 -377705080801"; do
+        CASE_ENV=("HOME=$HERMETIC_HOME" 'FORCE_COLOR=3' "TZ=$tz")
+        compare "reset bound in $tz [$spec]" \
+            "$(reset_payload "${spec% *}" "${spec#* }")"
+    done
 done
 
 # The reset row renders in local time, so a couple of zones are worth checking
@@ -532,32 +540,39 @@ case "$rust_out|$bash_out" in
 esac
 
 # ---------------------------------------------------------------------------
-# 8b. The Rust binary panics at the upper epoch bound
+# 8b. The binary still renders at the upper epoch bound
 #
-# `src/format/time.rs:33` applies the local offset with `to_offset`, which panics
-# when the shifted value leaves `OffsetDateTime`'s valid range. So a payload with
-# `resets_at` at the maximum valid timestamp aborts the whole render in any zone
-# east of UTC, printing nothing, while the bash port renders the row.
+# `src/format/time.rs` used to apply the local offset with `to_offset`, which
+# panics when the shifted value leaves `OffsetDateTime`'s valid range: a
+# `resets_at` at the maximum valid timestamp aborted the whole render in any
+# zone east of UTC and printed nothing at all. `checked_to_offset` replaced it,
+# so the row renders with its reset text omitted.
 #
-# This is asserted rather than skipped so that the suite speaks up if either
-# side changes: if the binary stops panicking here, this case fails and the
-# corresponding DIVERGENCE note in `claude-status-line.sh` should come out.
+# `compare` alone would not catch a regression here, since two programs that
+# both print nothing agree. This asserts the shape directly: a clean exit, a
+# status line on stdout, and no reset time inside it.
 # ---------------------------------------------------------------------------
 
-divergence_payload=$(printf '{"model":{"display_name":"M"},"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":253402300799}}}')
-rust_out=$(printf '%s' "$divergence_payload" |
-    env "HOME=$HERMETIC_HOME" TZ=Australia/Sydney FORCE_COLOR=3 "$BIN" 2>/dev/null)
+boundary_payload=$(printf '{"model":{"display_name":"M"},"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":253402300799}}}')
+# `--no-color` rather than `NO_COLOR=1`: the flag bypasses detection outright,
+# where the variable still loses to a `FORCE_COLOR` inherited from whatever
+# shell is running this.
+rust_out=$(printf '%s' "$boundary_payload" |
+    env "HOME=$HERMETIC_HOME" TZ=Australia/Sydney "$BIN" --no-color 2>/dev/null)
 rust_code=$?
-bash_out=$(printf '%s' "$divergence_payload" |
-    env "HOME=$HERMETIC_HOME" TZ=Australia/Sydney FORCE_COLOR=3 "$BASH_IMPL" 2>/dev/null)
-if [ "$rust_code" != 0 ] && [ -z "$rust_out" ] && [ -n "$bash_out" ]; then
-    PASS=$((PASS + 1))
-    [ "$VERBOSE" = 1 ] && printf 'ok    known divergence: binary panics at max epoch\n'
-else
+if [ "$rust_code" != 0 ] || [ -z "$rust_out" ]; then
     FAIL=$((FAIL + 1))
-    printf 'FAIL  known divergence at max epoch changed shape (binary exit %s)\n' "$rust_code"
+    printf 'FAIL  binary aborted at the maximum epoch (exit %s): the to_offset panic is back\n' \
+        "$rust_code"
+elif [ "${rust_out#*\[5H 10%\]}" = "$rust_out" ]; then
+    # `[5H 10%]`, with nothing between the percentage and the bracket, is the
+    # reset-less form. A rendered time would read `[5H 10% 11:59p]`.
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  max-epoch row did not render in the expected reset-less form\n'
     printf '        rust: %s\n' "$(printf '%s' "$rust_out" | cat -v)"
-    printf '        bash: %s\n' "$(printf '%s' "$bash_out" | cat -v)"
+else
+    PASS=$((PASS + 1))
+    [ "$VERBOSE" = 1 ] && printf 'ok    max epoch renders without its reset time\n'
 fi
 
 
