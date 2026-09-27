@@ -9,3 +9,7 @@
 #
 
 /target/
+
+# Staging area the release workflow packages archives in; also created by
+# running its Package step by hand.
+/dist/
