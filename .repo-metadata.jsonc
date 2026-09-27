@@ -14,7 +14,7 @@
   "owner": "chewygumxx",
   "slug": "chewygumxx/claude-status-line",
   "default_branch": "main",
-  "description": "Print formatted quote, intended as splash text",
+  "description": "Claude Code status line renderer, as a Rust binary and a byte-identical bash port",
   "category": "slop",
   "topics": ["slop", "llm", "generated-trash"],
   "license": {
