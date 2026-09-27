@@ -23,14 +23,36 @@ use time::{OffsetDateTime, UtcOffset, Weekday};
 /// next 12 hours, `Fri 4:32p` otherwise. Returns an empty string for a
 /// missing, zero, or unparseable epoch: the caller simply omits this part
 /// of the row rather than showing an error.
+///
+/// An epoch within one UTC offset of the representable maximum is also
+/// rendered as an empty string. Shifting such a timestamp into local time
+/// carries it past `OffsetDateTime`'s year-9999 ceiling, and the unchecked
+/// [`OffsetDateTime::to_offset`] panics rather than saturating. Omitting the
+/// reset text is the same thing this function already does for every other
+/// epoch it cannot make sense of, and it keeps
+/// [`render`](crate::render)'s promise never to fail outright: a panic here
+/// aborts the process and prints no status line at all.
 pub fn fmt_reset(epoch: Option<i64>, now: OffsetDateTime) -> String {
+    fmt_reset_at(epoch, now, local_offset())
+}
+
+/// [`fmt_reset`] with the UTC offset injected rather than read from the
+/// environment.
+///
+/// The offset is a parameter purely so the boundary cases above are testable:
+/// [`local_offset`] reports UTC under `cargo test`, for the reason documented
+/// on it, and UTC is the one offset that can never push a representable
+/// timestamp out of range.
+fn fmt_reset_at(epoch: Option<i64>, now: OffsetDateTime, offset: UtcOffset) -> String {
     let Some(epoch) = epoch.filter(|&e| e != 0) else {
         return String::new();
     };
     let Ok(utc) = OffsetDateTime::from_unix_timestamp(epoch) else {
         return String::new();
     };
-    let dt = utc.to_offset(local_offset());
+    let Some(dt) = utc.checked_to_offset(offset) else {
+        return String::new();
+    };
     let delta_s = epoch - now.unix_timestamp();
 
     let hour12 = match dt.hour() % 12 {
@@ -139,6 +161,53 @@ mod tests {
         let out = fmt_reset(Some(reset.unix_timestamp()), now);
         // Weekday-less form: no day abbreviation prefix.
         assert!(!out.contains(' '), "expected compact form, got {out:?}");
+    }
+
+    /// The largest and smallest epochs `OffsetDateTime::from_unix_timestamp`
+    /// accepts: 9999-12-31T23:59:59Z and -9999-01-01T00:00:00Z.
+    const EPOCH_MAX: i64 = 253_402_300_799;
+    const EPOCH_MIN: i64 = -377_705_116_800;
+
+    #[test]
+    fn reset_at_the_maximum_epoch_renders_in_utc() {
+        let now = datetime!(2026 - 08 - 31 12:00:00 UTC);
+        let out = fmt_reset_at(Some(EPOCH_MAX), now, UtcOffset::UTC);
+        assert_eq!(out, "Fri 11:59p");
+    }
+
+    /// Shifting the maximum epoch east carries it past year 9999, which
+    /// `to_offset` answers with a panic. Rendering nothing is the same
+    /// response this gives every other unusable epoch.
+    #[test]
+    fn reset_past_the_maximum_epoch_is_empty() {
+        let now = datetime!(2026 - 08 - 31 12:00:00 UTC);
+        let east = UtcOffset::from_hms(10, 0, 0).unwrap();
+        assert_eq!(fmt_reset_at(Some(EPOCH_MAX), now, east), "");
+        // One offset's worth below the ceiling is the widest window in which
+        // this can happen, and the far edge of it still renders.
+        let inside = EPOCH_MAX - 10 * 3600;
+        assert_ne!(fmt_reset_at(Some(inside), now, east), "");
+    }
+
+    /// The same overflow in the other direction: the minimum epoch shifted
+    /// west falls off the year -9999 floor.
+    #[test]
+    fn reset_before_the_minimum_epoch_is_empty() {
+        let now = datetime!(2026 - 08 - 31 12:00:00 UTC);
+        let west = UtcOffset::from_hms(-10, 0, 0).unwrap();
+        assert_eq!(fmt_reset_at(Some(EPOCH_MIN), now, west), "");
+        assert_ne!(fmt_reset_at(Some(EPOCH_MIN), now, UtcOffset::UTC), "");
+    }
+
+    /// An epoch outside the representable range never reaches the offset
+    /// shift at all: `from_unix_timestamp` rejects it first.
+    #[test]
+    fn reset_outside_the_representable_range_is_empty() {
+        let now = datetime!(2026 - 08 - 31 12:00:00 UTC);
+        assert_eq!(fmt_reset_at(Some(EPOCH_MAX + 1), now, UtcOffset::UTC), "");
+        assert_eq!(fmt_reset_at(Some(EPOCH_MIN - 1), now, UtcOffset::UTC), "");
+        assert_eq!(fmt_reset_at(Some(i64::MAX), now, UtcOffset::UTC), "");
+        assert_eq!(fmt_reset_at(Some(i64::MIN), now, UtcOffset::UTC), "");
     }
 
     #[test]
