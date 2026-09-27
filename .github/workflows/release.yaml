@@ -59,26 +59,12 @@ jobs:
               exit 1
           fi
 
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --locked
-
-      - name: Shellcheck
-        run: shellcheck claude-status-line.sh tests/compare-with-rust.sh
-
-      - name: Build For Differential Check
-        run: cargo build --locked --release
-
-      # The shell script is released alongside the binary as a drop-in
-      # stand-in for it, so parity between the two is a release blocker rather
-      # than a nicety. See tests/compare-with-rust.sh.
-      - name: Differential Check
-        run: tests/compare-with-rust.sh
+      # The same entry point CI and a local checkout use: formatting, clippy,
+      # the Rust tests, shellcheck, and the differential suite. The shell
+      # script is released alongside the binary as a drop-in stand-in for it,
+      # so parity between the two is a release blocker rather than a nicety.
+      - name: Check
+        run: tests/check.sh
 
   build:
     name: Build ${{ matrix.target }}
@@ -94,6 +80,19 @@ jobs:
             native: true
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            archive: tar.gz
+            suffix: ""
+            native: true
+          # Native arm64 Linux runners, free on a public repository, which
+          # beats cross-linking from x86_64 and lets the smoke test below
+          # actually execute what it built.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            suffix: ""
+            native: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
             archive: tar.gz
             suffix: ""
             native: true
@@ -251,21 +250,24 @@ jobs:
 
             | Platform | Asset |
             | --- | --- |
-            | Linux, any distribution | `claude-status-line-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz` |
-            | Linux, glibc 2.39+ | `claude-status-line-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux x86_64, any distribution | `claude-status-line-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz` |
+            | Linux x86_64, glibc 2.39+ | `claude-status-line-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux arm64, any distribution | `claude-status-line-${{ github.ref_name }}-aarch64-unknown-linux-musl.tar.gz` |
+            | Linux arm64, glibc 2.39+ | `claude-status-line-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz` |
             | macOS, Apple silicon | `claude-status-line-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz` |
             | macOS, Intel | `claude-status-line-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz` |
             | Windows, x64 | `claude-status-line-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip` |
             | Windows, arm64 | `claude-status-line-${{ github.ref_name }}-aarch64-pc-windows-msvc.zip` |
 
-            The musl build is statically linked and runs on any Linux
-            distribution; prefer it unless you have a reason not to. The macOS
+            The musl builds are statically linked and run on any Linux
+            distribution; prefer one unless you have a reason not to. The macOS
             binaries are unsigned and unnotarised, so Gatekeeper will want an
             `xattr -d com.apple.quarantine` on first run.
 
-            `claude-status-line.sh` needs bash 4 or newer, `jq` and GNU
-            `date`. That is the default on Linux; macOS needs Homebrew's
-            `bash` and `coreutils`, and Windows needs WSL or MSYS2.
+            `claude-status-line.sh` needs bash 4 or newer, `jq` and `git`. That
+            is the default on Linux; on macOS it wants Homebrew's `bash`,
+            since the system one is 3.2, though it will re-exec into a newer
+            one by itself if it finds it. On Windows it needs WSL or MSYS2.
 
             Point `statusLine.command` in `settings.json` at whichever one you
             install. Verify downloads with `sha256sum -c SHA256SUMS`.
