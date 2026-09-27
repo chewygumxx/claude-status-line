@@ -62,13 +62,29 @@ trap cleanup EXIT
 
 # Renders `$2` through both implementations under the environment given in the
 # `CASE_ENV` array, and compares the bytes.
+#
+# With `CASE_CLEAN=1` the ambient environment is discarded first and only
+# `PATH` survives alongside `CASE_ENV`. Colour-tier cases need that: they are
+# statements about an exact environment, and inheriting this machine's makes
+# them mean different things on different machines. A `CI=` case run on a CI
+# runner is the example that bit: `GITHUB_ACTION` is set there, which is
+# itself proof of a CI environment as far as `is_ci` is concerned, so the case
+# silently stopped testing what it named.
 CASE_ENV=()
+CASE_CLEAN=0
 compare() {
     local label=$1 payload=$2
     local rust_out bash_out rust_hex bash_hex
+    local -a runner
 
-    rust_out=$(printf '%s' "$payload" | env "${CASE_ENV[@]}" "$BIN" 2>/dev/null)
-    bash_out=$(printf '%s' "$payload" | env "${CASE_ENV[@]}" "$BASH_IMPL" 2>/dev/null)
+    if [ "$CASE_CLEAN" = 1 ]; then
+        runner=(env -i "PATH=$PATH" "${CASE_ENV[@]}")
+    else
+        runner=(env "${CASE_ENV[@]}")
+    fi
+
+    rust_out=$(printf '%s' "$payload" | "${runner[@]}" "$BIN" 2>/dev/null)
+    bash_out=$(printf '%s' "$payload" | "${runner[@]}" "$BASH_IMPL" 2>/dev/null)
     rust_hex=$(printf '%s' "$rust_out" | od -An -tx1 | tr -d ' \n')
     bash_hex=$(printf '%s' "$bash_out" | od -An -tx1 | tr -d ' \n')
 
@@ -159,14 +175,30 @@ tier_cases=(
     'TERM_PROGRAM=iTerm.app' 'TERM_PROGRAM=Apple_Terminal' 'TERM_PROGRAM=mintty'
     'TERM=xterm TERM_PROGRAM=Apple_Terminal'
     'CI=1' 'CI=' 'CI=true GITHUB_ACTIONS=true' 'TERM=screen-256color CI=1'
+    # `is_ci`, which is not the presence test it reads like. `CI` counts only
+    # at three exact values, while every other variable in its list counts by
+    # being set at all, `GITHUB_ACTION` (singular) among them. The `CI=` plus
+    # `GITHUB_ACTION` pairing is the one a CI runner produces for itself.
+    'CI=true' 'CI=woodpecker' 'CI=yes' 'CI=0' 'CI=false'
+    'GITHUB_ACTION=__run' 'CI= GITHUB_ACTION=__run' 'GITHUB_ACTIONS=true'
+    'JENKINS_URL=' 'bamboo.buildKey=x' 'CI_NAME=codeship' 'SHIPPABLE=true'
+    # Heroku's build image, the one entry in that list keyed on a value. The
+    # doubled slash is the crate's own, so the realistic path does not match
+    # and the contrived one does.
+    'NODE=/app/.heroku/node/bin/node' 'NODE=/app/.//heroku/node/bin/node'
+    # `CLICOLOR` is a separate rule from `CLICOLOR_FORCE` and counts unless it
+    # is exactly `0`.
+    'CLICOLOR=1' 'CLICOLOR=0' 'CLICOLOR=' 'CLICOLOR=00'
 )
 tier_payload=$(full_payload "$WORK/not-a-repo")
 mkdir -p "$WORK/not-a-repo"
+CASE_CLEAN=1
 for spec in "${tier_cases[@]}"; do
     # shellcheck disable=SC2206 # deliberate word splitting of the case spec
     CASE_ENV=("HOME=$HERMETIC_HOME" ${spec})
     compare "tier [${spec:-unset}]" "$tier_payload"
 done
+CASE_CLEAN=0
 
 
 # ---------------------------------------------------------------------------
