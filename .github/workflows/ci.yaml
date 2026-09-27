@@ -1,0 +1,106 @@
+# vim:set expandtab shiftwidth=4 filetype=yaml:
+# SPDX-License-Identifier: GPL-3.0-only
+
+#
+#
+# ~chewygumxx/claude-status-line.git
+# ::: :/.github/workflows/ci.yaml
+#
+#
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Every platform runs `tests/check.sh`, the same entry point used locally,
+  # rather than a list of commands maintained separately here. `matrix.steps`
+  # names which of its steps to run; empty means all of them.
+  check:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            steps: ""
+          - name: Linux aarch64
+            os: ubuntu-24.04-arm
+            steps: ""
+          # The bash port's other half of the world: no /proc, so
+          # `load_true_env` takes its `env` fallback, and /bin/bash is 3.2, so
+          # the suite's re-exec case stops being skipped and actually runs.
+          - name: macOS aarch64
+            os: macos-latest
+            steps: ""
+          # Rust only. The bash port wants a POSIX-ish userland and is
+          # documented as needing WSL or MSYS on Windows, so there is nothing
+          # here for `shellcheck` or the differential suite to say.
+          - name: Windows x86_64
+            os: windows-latest
+            steps: format clippy test
+
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Cargo
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The runner image ships bash 3.2, which the port refuses to run on and
+      # re-execs away from. A newer one has to exist for it to re-exec into.
+      - name: Install Bash
+        if: runner.os == 'macOS'
+        run: brew install bash
+
+      - name: Check
+        run: tests/check.sh ${{ matrix.steps }}
+
+  # Cheap enough to be worth catching on the way in rather than at tag time.
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          printf '%s\n' "$PWD" >> "$GITHUB_PATH"
+
+      # actionlint's bundled catalogue of action inputs lags the actions
+      # themselves, so it is run for its shell and expression analysis rather
+      # than as an authority on whether an input exists. `-ignore` covers the
+      # one input it is currently wrong about.
+      - name: Lint Workflows
+        run: |
+          actionlint -color \
+              -ignore 'input "client-id" is not defined in action "actions/create-github-app-token' \
+              -ignore 'missing input "app-id" which is required by action "actions/create-github-app-token'
