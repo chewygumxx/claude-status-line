@@ -439,11 +439,15 @@ local_offset_seconds() {
 # absent, zero, or out-of-range epoch.
 #
 # The Rust version reads hour/minute/weekday as integers off a parsed
-# `OffsetDateTime` specifically to avoid the non-portable `strftime("%-I")` the
-# original Python script used. This port needs a `date` call, but it asks for
-# `%H`/`%M`/`%a` and assembles the 12-hour clock itself, so there is still no
-# `%-I` in play. `LC_ALL=C` keeps the weekday abbreviation English rather than
-# locale-dependent, matching Rust's fixed `weekday_abbr` table.
+# `OffsetDateTime`, specifically to avoid the non-portable `strftime("%-I")` the
+# original Python script used, and this does the same with shell arithmetic
+# rather than by shelling out. Only three numbers are wanted from the
+# timestamp, and none of them needs the calendar: time of day is the remainder
+# modulo a day, and the weekday is the day count modulo seven. Calling `date`
+# for that would cost a fork, tie the script to GNU `date`'s `-d @epoch`
+# spelling (BSD and macOS want `-r`), and drag in a locale-dependent `%a` that
+# would then need `LC_ALL=C` to match Rust's fixed `weekday_abbr` table.
+WEEKDAY_ABBR=(Sun Mon Tue Wed Thu Fri Sat)
 fmt_reset() {
     local epoch=$1 now=$2
     R=''
@@ -453,33 +457,42 @@ fmt_reset() {
         return
     fi
 
-    local fields hour minute weekday
     local_offset_seconds
-    # `checked_to_offset`'s failure case: representable before the shift, off
-    # the end of the calendar after it. `R` carries the offset in at this
-    # point, so it has to go back to the empty return value before any early
-    # exit, or the offset itself ends up rendered as the reset time.
+    # Rust reads one offset (`UtcOffset::current_local_offset`, the offset right
+    # now) and applies it to every timestamp, so a reset on the far side of a
+    # daylight-saving boundary renders an hour off what a timezone-aware
+    # conversion would say. Shifting the epoch and treating the result as UTC
+    # reproduces that arithmetic rather than correcting it.
+    #
+    # `checked_to_offset`'s failure case follows: representable before the
+    # shift, off the end of the calendar after it. `R` carries the offset in at
+    # this point, so it has to go back to the empty return value before any
+    # early exit, or the offset itself ends up rendered as the reset time.
     local shifted=$((epoch + R))
     R=''
     if [ "$shifted" -lt "$EPOCH_MIN" ] || [ "$shifted" -gt "$EPOCH_MAX" ]; then
         return
     fi
-    # `date -d @<epoch>` would apply the offset in force *at that instant*,
-    # including historical and daylight-saving changes. Rust reads one offset
-    # (`UtcOffset::current_local_offset`, the offset right now) and applies it to
-    # every timestamp, so a reset on the far side of a daylight-saving boundary
-    # renders an hour off what `date` would say. Shifting the epoch and
-    # formatting in UTC reproduces Rust's arithmetic instead of correcting it.
-    fields=$(LC_ALL=C date -u -d "@$shifted" '+%H %M %a' 2>/dev/null) || return
-    read -r hour minute weekday <<<"$fields"
-    [ -z "$hour" ] && return
 
-    # `10#` forces base ten: `date`'s zero-padded `08` would otherwise be read
-    # as an invalid octal literal.
-    local h=$((10#$hour)) suffix='p'
+    # Bash's `/` and `%` truncate toward zero, so a pre-1970 timestamp needs
+    # nudging back onto a floored division before the remainder means "seconds
+    # into the day".
+    local days=$((shifted / 86400)) secs=$((shifted % 86400))
+    if [ "$secs" -lt 0 ]; then
+        secs=$((secs + 86400))
+        days=$((days - 1))
+    fi
+
+    local h=$((secs / 3600)) suffix='p'
     [ "$h" -lt 12 ] && suffix='a'
     local hour12=$((h % 12))
     [ "$hour12" = 0 ] && hour12=12
+    local minute
+    printf -v minute '%02d' $((secs / 60 % 60))
+
+    # 1970-01-01 was a Thursday, which is index 4 of the table above. The extra
+    # `+ 7` keeps the result non-negative for dates before it.
+    local weekday=${WEEKDAY_ABBR[((days + 4) % 7 + 7) % 7]}
 
     local compact="${hour12}:${minute}${suffix}"
     local delta=$((epoch - now))
