@@ -74,10 +74,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # The runner image ships bash 3.2, which the port refuses to run on and
-      # re-execs away from. A newer one has to exist for it to re-exec into.
-      - name: Install Bash
+      # re-execs away from, so a newer one has to exist for it to re-exec
+      # into. Neither does the image carry shellcheck, which `tests/check.sh`
+      # would otherwise report as skipped.
+      - name: Install Bash And Shellcheck
         if: runner.os == 'macOS'
-        run: brew install bash
+        run: brew install bash shellcheck
 
       - name: Check
         run: tests/check.sh ${{ matrix.steps }}
