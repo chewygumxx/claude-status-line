@@ -1,0 +1,268 @@
+# vim:set expandtab shiftwidth=4 filetype=yaml:
+# SPDX-License-Identifier: GPL-3.0-only
+
+#
+#
+# ~chewygumxx/claude-status-line.git
+# ::: :/.github/workflows/release.yaml
+#
+#
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Builds and uploads every artefact as a workflow artefact without cutting a
+  # release, so the macOS and Windows legs can be exercised before a tag is
+  # spent on them. The release job below is skipped on this trigger.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything that can go wrong cheaply goes wrong here, once, before six
+  # build legs spend runner minutes (macOS bills at 10x and Windows at 2x on a
+  # private repository).
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Cargo
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # A tag that disagrees with the manifest ships assets whose recorded
+      # version differs from the tag they hang off, which tends to be noticed
+      # only once someone is trying to reproduce a bug against the wrong
+      # source.
+      - name: Check Tag Matches Manifest
+        if: github.ref_type == 'tag'
+        run: |
+          manifest=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$manifest" != "$GITHUB_REF_NAME" ]; then
+              printf '::error::tag %s does not match Cargo.toml version %s\n' \
+                  "$GITHUB_REF_NAME" "$manifest"
+              exit 1
+          fi
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Shellcheck
+        run: shellcheck claude-status-line.sh tests/compare-with-rust.sh
+
+      - name: Build For Differential Check
+        run: cargo build --locked --release
+
+      # The shell script is released alongside the binary as a drop-in
+      # stand-in for it, so parity between the two is a release blocker rather
+      # than a nicety. See tests/compare-with-rust.sh.
+      - name: Differential Check
+        run: tests/compare-with-rust.sh
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            suffix: ""
+            native: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            suffix: ""
+            native: true
+          # macos-latest is Apple silicon; the Apple toolchain it carries
+          # targets both architectures, so the Intel build needs no more than
+          # the extra rustup target.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            suffix: ""
+            native: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            suffix: ""
+            native: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            suffix: .exe
+            native: true
+          # The Windows runner image carries the MSVC ARM64 tools
+          # (Microsoft.VisualStudio.Component.VC.Tools.ARM64), so rustc finds
+          # a cross linker unaided. Should that ever stop being true, prepend
+          # ilammy/msvc-dev-cmd with `arch: amd64_arm64` to this leg.
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            suffix: .exe
+            native: false
+
+    runs-on: ${{ matrix.os }}
+
+    # Git Bash is present on the Windows runners, so one packaging script
+    # serves all three operating systems.
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      # A status line is re-rendered on every prompt, so the shipped artefact
+      # is tuned for start-up cost and size over build time. Setting this via
+      # the environment keeps the release profile out of Cargo.toml, where it
+      # would also slow down every local `cargo build --release`.
+      CARGO_PROFILE_RELEASE_LTO: "true"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Cargo
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-gcc
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # Only the natively runnable legs: nothing on these runners executes an
+      # arm64 Windows binary, and Rosetta is not guaranteed on the macOS
+      # image. An empty payload is the harshest realistic input, since every
+      # field then takes its fallback path.
+      - name: Smoke Test
+        if: matrix.native
+        env:
+          BIN: target/${{ matrix.target }}/release/${{ github.event.repository.name }}${{ matrix.suffix }}
+        run: |
+          out=$(printf '{}' | "$BIN" --no-color)
+          printf '%s\n' "$out"
+          case $out in
+              *'[CTX'*) ;;
+              *)
+                  printf '::error::smoke test produced no recognisable status line\n'
+                  exit 1
+                  ;;
+          esac
+
+      - name: Package
+        env:
+          NAME: ${{ github.event.repository.name }}
+          TARGET: ${{ matrix.target }}
+          SUFFIX: ${{ matrix.suffix }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          version=$GITHUB_REF_NAME
+          [ "$GITHUB_REF_TYPE" = tag ] || version=$(git rev-parse --short HEAD)
+          staging="$NAME-$version-$TARGET"
+          mkdir -p "dist/$staging"
+          cp "target/$TARGET/release/$NAME$SUFFIX" "dist/$staging/"
+          cp LICENSE "dist/$staging/"
+          cd dist
+          if [ "$ARCHIVE" = zip ]; then
+              7z a -tzip "$staging.zip" "$staging" > /dev/null
+          else
+              tar -czf "$staging.tar.gz" "$staging"
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ github.event.repository.name }}-${{ matrix.target }}
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      # The shell script and the licence are attached straight from the tag
+      # rather than routed through a build leg, so this job needs the
+      # checkout the build legs already have.
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # The bash port is attached on its own rather than bundled into each
+      # archive: it wants bash 4+, jq and GNU date, none of which are a given
+      # on macOS or on Windows, and one copy keeps its checksum stable across
+      # platforms.
+      - name: Collect Assets
+        run: |
+          cp claude-status-line.sh LICENSE artifacts/
+          (cd artifacts && sha256sum -- *) > SHA256SUMS
+          mv SHA256SUMS artifacts/
+
+      - name: Compile Release Asset
+        uses: softprops/action-gh-release@v3
+        with:
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/claude-status-line.sh
+            artifacts/LICENSE
+            artifacts/SHA256SUMS
+          body: |
+            Both implementations ship in this release: the compiled binary,
+            built for each platform below, and `claude-status-line.sh`, a bash
+            port that renders byte-identical output. Every tag runs the two
+            against each other before publishing.
+
+            | Platform | Asset |
+            | --- | --- |
+            | Linux, any distribution | `claude-status-line-${{ github.ref_name }}-x86_64-unknown-linux-musl.tar.gz` |
+            | Linux, glibc 2.39+ | `claude-status-line-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | macOS, Apple silicon | `claude-status-line-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz` |
+            | macOS, Intel | `claude-status-line-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz` |
+            | Windows, x64 | `claude-status-line-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip` |
+            | Windows, arm64 | `claude-status-line-${{ github.ref_name }}-aarch64-pc-windows-msvc.zip` |
+
+            The musl build is statically linked and runs on any Linux
+            distribution; prefer it unless you have a reason not to. The macOS
+            binaries are unsigned and unnotarised, so Gatekeeper will want an
+            `xattr -d com.apple.quarantine` on first run.
+
+            `claude-status-line.sh` needs bash 4 or newer, `jq` and GNU
+            `date`. That is the default on Linux; macOS needs Homebrew's
+            `bash` and `coreutils`, and Windows needs WSL or MSYS2.
+
+            Point `statusLine.command` in `settings.json` at whichever one you
+            install. Verify downloads with `sha256sum -c SHA256SUMS`.
