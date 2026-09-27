@@ -187,6 +187,45 @@ force_color_level() {
     R=0
 }
 
+# Every variable `is_ci` treats as proof of a CI environment purely by being
+# set, to any value at all, empty included. Transcribed from `is_ci` 1.2.0, the
+# version `supports-color` 3.0.2 pulls in; the order is the crate's own, though
+# nothing observes it. Note `GITHUB_ACTION`, singular: the per-step action id
+# GitHub Actions sets, not the `GITHUB_ACTIONS` flag everyone reaches for.
+IS_CI_PRESENT=(
+    CI_NAME GITHUB_ACTION GITLAB_CI NETLIFY TRAVIS
+    CODEBUILD_SRC_DIR BUILDER_OUTPUT GITLAB_DEPLOYMENT NOW_GITHUB_DEPLOYMENT
+    NOW_BUILDER BITBUCKET_DEPLOYMENT GERRIT_PROJECT
+    SYSTEM_TEAMFOUNDATIONCOLLECTIONURI BITRISE_IO BUDDY_WORKSPACE_ID BUILDKITE
+    CIRRUS_CI APPVEYOR CIRCLECI SEMAPHORE DRONE DSARI TDDIUM STRIDER
+    TASKCLUSTER_ROOT_URL JENKINS_URL bamboo.buildKey GO_PIPELINE_NAME
+    HUDSON_URL WERCKER MAGNUM NEVERCODE RENDER SAIL_CI SHIPPABLE
+)
+
+# True when `is_ci::uncached()` would be true.
+#
+# `CI` is the odd one out: it counts only when it holds one of three exact
+# values, so `CI=yes` and `CI=` are both *not* a CI environment as far as the
+# crate is concerned, while a bare `JENKINS_URL=` is.
+is_ci() {
+    local name
+    env_value CI
+    case $R in
+        true | 1 | woodpecker) return 0 ;;
+    esac
+    for name in "${IS_CI_PRESENT[@]}"; do
+        env_is_set "$name" && return 0
+    done
+    # The single entry keyed on a value rather than on presence: Heroku's build
+    # image. The doubled slash is the crate's, not a typo here, and it makes
+    # the test rather harder to satisfy by accident than it looks.
+    env_value NODE
+    case $R in
+        *//heroku/node/bin/node) return 0 ;;
+    esac
+    return 1
+}
+
 # Detects the colour tier, reproducing `supports-color` 3.0.2's decision order
 # as the Rust program experiences it.
 #
@@ -221,11 +260,10 @@ detect_tier() {
         fi
     fi
 
-    local term colorterm program ci
+    local term colorterm program
     env_value TERM && term=$R
     env_value COLORTERM && colorterm=$R
     env_value TERM_PROGRAM && program=$R
-    env_value CI && ci=$R
 
     if [ "$term" = dumb ]; then
         TIER='plain'
@@ -245,9 +283,16 @@ detect_tier() {
     fi
 
     # `TERM` and `COLORTERM` count as soon as they are set, even to an empty
-    # value, whereas `CI` has to be non-empty: an asymmetry in the crate,
-    # preserved here.
-    if env_is_set TERM || env_is_set COLORTERM || [ -n "$ci" ]; then
+    # value (a bare `TERM=` reaches here only because `TERM=dumb` returned
+    # above, which is exactly what the crate's `check_ansi_color` works out
+    # to). `CLICOLOR` counts unless it is the string `0`. `CI` gets the crate's
+    # own rules, which are not a presence test: see `is_ci` above.
+    local clicolor=0
+    if env_is_set CLICOLOR; then
+        env_value CLICOLOR
+        [ "$R" != 0 ] && clicolor=1
+    fi
+    if env_is_set TERM || env_is_set COLORTERM || [ "$clicolor" = 1 ] || is_ci; then
         TIER='ansi16'
         return
     fi
