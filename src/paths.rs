@@ -49,8 +49,8 @@ mod tests {
 
     #[test]
     fn relative_to_nested_path_strips_base() {
-        let base = Path::new("/home/chewygum/dev/claude-status-line");
-        let path = Path::new("/home/chewygum/dev/claude-status-line/src/render.rs");
+        let base = Path::new("/home/chewygumxx/dev/claude-status-line");
+        let path = Path::new("/home/chewygumxx/dev/claude-status-line/src/render.rs");
         assert_eq!(
             relative_to(path, base),
             Some(PathBuf::from("src/render.rs"))
@@ -59,15 +59,15 @@ mod tests {
 
     #[test]
     fn relative_to_equal_paths_is_empty_not_dot() {
-        let base = Path::new("/home/chewygum/dev/claude-status-line");
+        let base = Path::new("/home/chewygumxx/dev/claude-status-line");
         let rel = relative_to(base, base).unwrap();
         assert_eq!(rel.as_os_str(), "");
     }
 
     #[test]
     fn relative_to_non_prefix_is_none() {
-        let base = Path::new("/home/chewygum/dev/claude-status-line");
-        let path = Path::new("/home/chewygum/other-project/src/main.rs");
+        let base = Path::new("/home/chewygumxx/dev/claude-status-line");
+        let path = Path::new("/home/chewygumxx/other-project/src/main.rs");
         assert_eq!(relative_to(path, base), None);
     }
 
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn nested_path_shortens_with_slash() {
         let home = Path::new("/home/chewygum");
-        let nested = Path::new("/home/chewygum/dev/claude-status-line");
+        let nested = Path::new("/home/chewygumxx/dev/claude-status-line");
         let rest = nested.strip_prefix(home).unwrap();
         assert_eq!(format!("~/{}", rest.display()), "~/dev/claude-status-line");
     }
